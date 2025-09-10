@@ -125,7 +125,7 @@ with colC:
 with colA:
     st.session_state.acero_Skg    = st.number_input("Acero (S/ por kg)", value=float(st.session_state.acero_Skg), step=0.1)
 
-st.markdown("## Rangos de diseño (B, L, h) ↪")
+st.markdown("## Rangos de diseño (B, L, h) ")
 r1, r2, r3 = st.columns(3)
 with r1:
     st.session_state.B_min, st.session_state.B_max = st.slider("Base B (m)", 0.6, 5.0,
@@ -304,6 +304,7 @@ with b1:
     if st.button("🧪 Cargar demo segura", type="secondary"):
         set_demo_soft(); st.rerun()
 with b2:
-    st.caption("Resultados compactos con conclusiones para tu informe.")
+    st.caption("Resultados")
+
 
 
