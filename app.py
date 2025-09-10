@@ -16,7 +16,7 @@ st.set_page_config(page_title="Optimización de Cimentaciones", layout="wide")
 # ---------- UTILIDADES ----------
 
 PALETTE = px.colors.sequential.Tealgrn
-INFO = "Ingresa los datos en la parte izquierda y pulsa Analizar y optimizar o Optimizar con GA."
+INFO = "Ingresa los datos y pulsa Analizar y optimizar o Optimizar con GA."
 
 DEFAULTS = {
     # suelo demo segura (arcilla blanda)
@@ -335,3 +335,4 @@ if run_bruteforce or run_ga:
 # Mensaje inicial si no se ha ejecutado nada
 if (best is None) and not (run_bruteforce or run_ga):
     st.info("Configura los parámetros y pulsa **Analizar y optimizar**.")
+
