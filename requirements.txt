@@ -1,10 +1,8 @@
 streamlit
 numpy
 pandas
-matplotlib
 plotly
-reportlab
-xlsxwriter
+
 
 
 
