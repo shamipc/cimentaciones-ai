@@ -1,9 +1,12 @@
 streamlit
 numpy
 pandas
-plotly>=5.22
-xlsxwriter
+matplotlib
+plotly
 reportlab
+xlsxwriter
+
+
 
 
 
