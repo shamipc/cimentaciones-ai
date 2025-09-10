@@ -1,8 +1,7 @@
 streamlit
 numpy
 pandas
-matplotlib
-plotly
+plotly>=5.22
 reportlab
 openpyxl
 
