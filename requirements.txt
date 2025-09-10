@@ -2,7 +2,8 @@ streamlit
 numpy
 pandas
 matplotlib
-plotly
-reportlab
 plotly>=5.22
+reportlab
+kaleido
+
 
