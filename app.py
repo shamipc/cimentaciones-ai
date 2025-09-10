@@ -72,7 +72,7 @@ def costo(B, L, h, concreto_Sm3, acero_Skg):
 # ---------- Encabezado ----------
 st.title("Optimización de Cimentaciones")
 st.caption("Diseño óptimo por costo cumpliendo capacidad admisible — vista compacta")
-st.info("Ingresa **los datos** en la parte inferior y pulsa **Analizar y optimizar** u **Optimizar con GA**.")
+st.info("Ingresa **los datos** , pulsa **Analizar y optimizar** u **Optimizar con GA**.")
 
 # ---------- BLOQUE 1: Parámetros de entrada ----------
 st.markdown("## Parámetros de entrada")
@@ -280,4 +280,5 @@ with b1:
         st.rerun()
 with b2:
     st.caption("Versión estable: rango amplio + GA de respaldo para evitar ‘sin resultados’.")
+
 
