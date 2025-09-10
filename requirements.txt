@@ -4,3 +4,5 @@ pandas
 matplotlib
 plotly
 reportlab
+plotly>=5.22
+
