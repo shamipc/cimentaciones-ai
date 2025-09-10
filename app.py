@@ -1,260 +1,241 @@
+
+# -------------------------------
+# Optimización de Cimentaciones
+# vista compacta + gráficos elegantes
+# -------------------------------
 import streamlit as st
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
+import plotly.express as px
 
-# ---------------------- CONFIG BÁSICA ----------------------
-st.set_page_config(
-    page_title="Optimización de Cimentaciones",
-    page_icon="📐",
-    layout="wide"
-)
+# ---------- CONFIG ----------
+st.set_page_config(page_title="Optimización de Cimentaciones", layout="wide")
 
-# ---------------------- ESTILOS (CSS) ----------------------
+# ---------- CSS suave ----------
 st.markdown("""
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;800&display=swap" rel="stylesheet">
 <style>
-    html, body, [class*="css"]  {
-        font-family: 'Inter', sans-serif;
-    }
-    .app-title {
-        font-weight: 800;
-        font-size: 2.1rem;
-        letter-spacing: 0.3px;
-        margin-bottom: 0.25rem;
-    }
-    .app-subtitle{
-        color: #94a3b8;
-        margin-top: -6px;
-        margin-bottom: 1.3rem;
-        font-size: 0.95rem;
-    }
-    .card {
-        background: #0b1220;
-        border: 1px solid rgba(148,163,184,0.15);
-        padding: 1.1rem 1.1rem 0.9rem 1.1rem;
+    .main { padding-top: 1rem; }
+    h1, h2, h3 { font-weight: 700; letter-spacing: .2px; }
+    .small-muted { color: #6b7280; font-size: .95rem; }
+    .kpi-card {
+        background: #ffffff;
+        border: 1px solid #e5e7eb;
         border-radius: 14px;
-        box-shadow: 0 8px 30px rgba(2,12,27,0.35);
+        padding: 18px 20px;
+        box-shadow: 0 8px 16px rgba(17, 24, 39, .05);
     }
-    .good-badge{
-        display:inline-block;
-        background: linear-gradient(90deg,#22c55e,#10b981);
-        color: white;
-        font-weight: 600;
-        padding: 6px 10px;
-        border-radius: 30px;
-        font-size: 0.85rem;
-        letter-spacing: .2px;
+    .kpi-title { font-size: .90rem; color: #6b7280; margin-bottom: .15rem; }
+    .kpi-value { font-size: 2.0rem; font-weight: 700; color: #111827; }
+    .ok-chip { display:inline-block; background:#10b981; color:#fff; padding:.35rem .6rem; border-radius:999px; font-weight:600; }
+    .warn-chip { display:inline-block; background:#f59e0b; color:#111827; padding:.35rem .6rem; border-radius:999px; font-weight:700; }
+    .bad-chip { display:inline-block; background:#ef4444; color:#fff; padding:.35rem .6rem; border-radius:999px; font-weight:600; }
+    .panel {
+        background: #ffffff;
+        border: 1px solid #e5e7eb;
+        border-radius: 14px;
+        padding: 14px 18px;
+        box-shadow: 0 10px 20px rgba(17,24,39, .04);
     }
-    .warn-badge{
-        display:inline-block;
-        background: linear-gradient(90deg,#f59e0b,#ef4444);
-        color: white;
-        font-weight: 600;
-        padding: 6px 10px;
-        border-radius: 30px;
-        font-size: 0.85rem;
-        letter-spacing: .2px;
-    }
-    .metric-grid{
-        display: grid;
-        grid-template-columns: repeat(4, minmax(0,1fr));
-        gap: 10px;
-        margin-top: .75rem;
-        margin-bottom: .6rem;
-    }
-    .mini{font-size: .85rem; color:#94a3b8; margin-bottom: .4rem}
-    .vsep{height:10px}
 </style>
 """, unsafe_allow_html=True)
 
-# ---------------------- SIDEBAR ----------------------
+# ---------- Helpers ----------
+def bearing_capacity_terzaghi(gamma, c, phi_deg, B, D):
+    """Terzaghi (c + q + γ) para zapata corrida (simplificado y estable)."""
+    phi = np.radians(phi_deg)
+    q = gamma * D
+
+    # Factores N (robustos para φ=0)
+    if phi_deg <= 1e-6:
+        Nq = 1.0
+        Nc = 5.7
+        Nγ = 0.0
+    else:
+        Nq = np.exp(np.pi * np.tan(phi)) * (np.tan(np.pi/4 + phi/2))**2
+        Nc = (Nq - 1.0) / np.tan(phi)
+        # Aproximación estable para Nγ
+        Nγ = 2 * (Nq + 1) * np.tan(phi)
+
+    qu = c * Nc + q * Nq + 0.5 * gamma * B * Nγ
+    return qu
+
+def costo_aprox(B, L, h, costo_concreto, costo_acero):
+    # Concreto: volumen * S/, Acero: 1% del peso del concreto
+    volumen = B * L * h              # m3
+    peso_concreto = volumen * 2.4e3  # kg (≈2.4 t/m3)
+    costo = volumen * costo_concreto + (0.01 * peso_concreto) * costo_acero
+    return costo
+
+def recomendaciones(q_req, q_adm, h, FS, mejor):
+    tips = []
+    margen = (q_adm - q_req) / q_adm if q_adm > 0 else -1
+
+    if q_adm <= q_req:
+        tips.append("⚠️ La capacidad admisible **no supera** la requerida. "
+                    "Aumenta B o L, reduce N, o emplea un FS menor (si está técnicamente justificado).")
+    elif margen < 0.15:
+        tips.append("✅ Cumple, pero con **margen ajustado** (<15%). "
+                    "Puedes subir ligeramente B o L, o aumentar h para mayor rigidez.")
+    else:
+        tips.append("✅ Buen diseño: margen suficiente entre capacidad y demanda.")
+
+    if h < 0.6:
+        tips.append("⬆️ Considera **h ≥ 0.6 m** para mejorar rigidez y facilitar armado.")
+    if FS > 3.5:
+        tips.append("ℹ️ El **FS** es alto. Si el proyecto lo permite, un FS más moderado puede disminuir costos.")
+    if mejor["Costo (S/)"] > 0:
+        tips.append(f"💡 Tu **óptimo** actual cuesta **S/ {mejor['Costo (S/)']:.0f}**; "
+                    "revisa alternativas con B y L ligeramente mayores si necesitas más margen.")
+    return tips
+
+# ---------- Sidebar (Inputs) ----------
 st.sidebar.header("Parámetros de entrada")
 
-modelo = st.sidebar.selectbox(
-    "Modelo de capacidad",
-    ["Terzaghi (recomendado)","Meyerhof (simple)","Vesic (simple)"],
-    index=0
-)
+modelo = st.sidebar.selectbox("Modelo de capacidad", ["Terzaghi (recomendado)", "Modelo simple"])
 
 gamma = st.sidebar.number_input("Peso unitario γ (kN/m³)", 10.0, 25.0, 18.0, step=0.1)
-c = st.sidebar.number_input("Cohesión c (kPa)", 0.0, 200.0, 20.0, step=0.5)
-phi = st.sidebar.number_input("Ángulo de fricción φ (°)", 0.0, 45.0, 35.0, step=0.5)
-D = st.sidebar.number_input("Profundidad D (m)", 0.5, 3.0, 1.5, step=0.1)
-N = st.sidebar.number_input("Carga N (kN)", 100.0, 6000.0, 1000.0, step=10.0)
-FS = st.sidebar.number_input("Factor de seguridad", 1.5, 5.0, 2.5, step=0.1)
+c     = st.sidebar.number_input("Cohesión c (kPa)", 0.0, 200.0, 20.0, step=0.5)
+phi   = st.sidebar.number_input("Ángulo de fricción φ (°)", 0.0, 45.0, 35.0, step=0.5)
+D     = st.sidebar.number_input("Profundidad D (m)", 0.5, 3.0, 1.5, step=0.1)
+N     = st.sidebar.number_input("Carga N (kN)", 100.0, 6000.0, 1000.0, step=10.0)
+FS    = st.sidebar.number_input("Factor de seguridad", 1.5, 5.0, 2.5, step=0.1)
 
 st.sidebar.subheader("Costos")
 costo_concreto = st.sidebar.number_input("Concreto (S/ por m³)", 300, 1500, 650, step=10)
-costo_acero = st.sidebar.number_input("Acero (S/ por kg)", 3.0, 10.0, 5.5, step=0.1)
+costo_acero    = st.sidebar.number_input("Acero (S/ por kg)", 3.0, 12.0, 5.50, step=0.1)
 
 st.sidebar.subheader("Rangos de diseño")
-B_min, B_max = st.sidebar.slider("Base B (m)", 1.2, 3.8, (1.2, 3.8), step=0.1)
-L_min, L_max = st.sidebar.slider("Largo L (m)", 1.2, 3.8, (1.2, 3.8), step=0.1)
-h_min, h_max = st.sidebar.slider("Altura h (m)", 0.6, 1.2, (0.6, 1.2), step=0.05)
+B_min, B_max = st.sidebar.slider("Base B (m)", 1.0, 3.8, (1.2, 3.8), step=0.1)
+L_min, L_max = st.sidebar.slider("Largo L (m)", 1.0, 3.8, (1.2, 3.8), step=0.1)
+h_min, h_max = st.sidebar.slider("Altura h (m)", 0.4, 1.2, (0.6, 1.2), step=0.05)
 paso = 0.1
 
 st.sidebar.subheader("Adjuntos")
-up = st.sidebar.file_uploader("Sube una imagen (perfil del suelo, croquis)", type=["png","jpg","jpeg"])
+up = st.sidebar.file_uploader("Sube croquis o perfil estratigráfico (PNG/JPG)", type=["png","jpg","jpeg"])
 
-run = st.sidebar.button("🔍 Analizar y optimizar", use_container_width=True)
+analizar = st.sidebar.button("🔎 Analizar y optimizar", use_container_width=True)
 
-# ---------------------- FUNCIONES DE CÁLCULO ----------------------
-def bearing_capacity_factors(phi_deg: float):
-    """Factores de capacidad (aprox. clásicas)."""
-    phi = np.radians(phi_deg)
-    if phi_deg == 0:
-        Nq = 1.0
-        Nc = 5.7
-        Ny = 0.0
-        return Nc, Nq, Ny
+# ---------- Encabezado ----------
+st.title("Optimización de Cimentaciones")
+st.caption("Diseño óptimo por costo cumpliendo capacidad admisible — **vista compacta**")
 
-    Nq = np.exp(np.pi*np.tan(phi)) * (np.tan(np.pi/4 + phi/2))**2
-    Nc = (Nq - 1.0)/np.tan(phi)
-    Ny = 2.0*(Nq + 1.0) * np.tan(phi)
-    return Nc, Nq, Ny
-
-def capacidad_portante_qu(modelo, c, gamma, D, B, phi_deg):
-    """qu (kPa) sin FS, con fórmulas simples."""
-    Nc, Nq, Ny = bearing_capacity_factors(phi_deg)
-
-    # Coef. sencillos por modelo (afinación ligera de Ny)
-    if "Terzaghi" in modelo:
-        s_c, s_q, s_y = 1.0, 1.0, 1.0
-    elif "Meyerhof" in modelo:
-        s_c, s_q, s_y = 1.1, 1.05, 0.9
-    else:  # Vesic simple
-        s_c, s_q, s_y = 1.15, 1.1, 1.0
-
-    qu = c*Nc*s_c + gamma*D*Nq*s_q + 0.5*gamma*B*Ny*s_y  # kPa
-    return qu
-
-def costo_total(B,L,h, costo_conc, costo_ac):
-    volumen = B*L*h
-    peso_concreto = volumen * 2.4 * 1000  # kg (2.4 t/m³)
-    costo = volumen*costo_conc + (peso_concreto*0.01)*costo_ac  # acero como 1% del peso
-    return costo
-
-# ---------------------- ENCABEZADO ----------------------
-st.markdown('<div class="app-title">Optimización de Cimentaciones</div>', unsafe_allow_html=True)
-st.markdown('<div class="app-subtitle">Diseño óptimo por costo cumpliendo capacidad admisible — vista compacta</div>', unsafe_allow_html=True)
-
-# ---------------------- LÓGICA PRINCIPAL ----------------------
-if not run:
-    st.info("Configura los parámetros a la izquierda y pulsa **Analizar y optimizar**.", icon="🛠️")
+if not analizar:
+    st.info("🛠️ Configura los parámetros a la izquierda y pulsa **Analizar y optimizar**.", icon="🧰")
     st.stop()
 
-# Generar combinaciones y evaluar
-resultados = []
-for B in np.arange(B_min, B_max + 1e-9, paso):
-    for L in np.arange(L_min, L_max + 1e-9, paso):
-        for h in np.arange(h_min, h_max + 1e-9, paso):
+# ---------- Cálculo de combinaciones ----------
+Bs = np.arange(B_min, B_max + 1e-9, paso)
+Ls = np.arange(L_min, L_max + 1e-9, paso)
+hs = np.arange(h_min, h_max + 1e-9, paso)
+
+rows = []
+for B in Bs:
+    for L in Ls:
+        for h in hs:
             area = B * L
-            qu = capacidad_portante_qu(modelo, c, gamma, D, B, phi)
-            qadm = qu / FS
-            qreq = N / area
-            cumple = qadm > qreq
-            costo = costo_total(B, L, h, costo_concreto, costo_acero)
-            resultados.append([B, L, h, qadm, qreq, cumple, costo])
+            q_req = N / area  # kPa (kN/m2)
+            if modelo.startswith("Terzaghi"):
+                qu = bearing_capacity_terzaghi(gamma, c, phi, B, D)
+            else:
+                # Modelo simple (conservador)
+                qu = 1.3 * c * (1 + 0.2 * (B / L)) + (gamma * D * np.tan(np.radians(phi)))
+            q_adm = qu / FS
+            cumple = q_adm > q_req
+            costo = costo_aprox(B, L, h, costo_concreto, costo_acero)
+            rows.append([B, L, h, q_adm, q_req, cumple, costo])
 
-df = pd.DataFrame(
-    resultados,
-    columns=["B (m)","L (m)","h (m)","q_adm (kPa)","q_req (kPa)","Cumple","Costo (S/)"]
-)
-
+df = pd.DataFrame(rows, columns=["B (m)", "L (m)", "h (m)", "q_adm (kPa)", "q_req (kPa)", "Cumple", "Costo (S/)"])
 df_validos = df[df["Cumple"] == True].copy()
 
-colL, colR = st.columns([1.15, 1])
+# ---------- Si no hay válidos ----------
+if df_validos.empty:
+    st.error("No se encontraron diseños que cumplan con la capacidad admisible. "
+             "Prueba con B/L mayores, φ o c más altos, FS menor o N menor.", icon="⚠️")
+    st.stop()
 
-# ---------------------- IZQUIERDA: TARJETAS RESUMEN ----------------------
-with colL:
-    st.markdown('<div class="card">', unsafe_allow_html=True)
-    if df_validos.empty:
-        st.markdown('<span class="warn-badge">Sin soluciones que cumplan</span>', unsafe_allow_html=True)
-        st.write("Prueba con **B y L mayores**, **φ o c más altos**, **FS menor** o una **carga N** más pequeña.")
-    else:
-        mejor = df_validos.loc[df_validos["Costo (S/)"].idxmin()]
+# ---------- Óptimo ----------
+mejor = df_validos.loc[df_validos["Costo (S/)"].idxmin()]
 
-        st.markdown('<span class="good-badge">Diseño óptimo encontrado</span>', unsafe_allow_html=True)
+# ---------- Tarjetas KPI ----------
+col1, col2, col3, col4 = st.columns(4)
+with col1:
+    st.markdown('<div class="kpi-card"><div class="kpi-title">B (m)</div>'
+                f'<div class="kpi-value">{mejor["B (m)"]:.2f}</div></div>', unsafe_allow_html=True)
+with col2:
+    st.markdown('<div class="kpi-card"><div class="kpi-title">L (m)</div>'
+                f'<div class="kpi-value">{mejor["L (m)"]:.2f}</div></div>', unsafe_allow_html=True)
+with col3:
+    st.markdown('<div class="kpi-card"><div class="kpi-title">h (m)</div>'
+                f'<div class="kpi-value">{mejor["h (m)"]:.2f}</div></div>', unsafe_allow_html=True)
+with col4:
+    st.markdown('<div class="kpi-card"><div class="kpi-title">Costo (S/)</div>'
+                f'<div class="kpi-value">{mejor["Costo (S/)"]:.0f}</div></div>', unsafe_allow_html=True)
 
-        # Métricas
-        st.markdown('<div class="metric-grid">', unsafe_allow_html=True)
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("B (m)", f"{mejor['B (m)']:.2f}")
-        c2.metric("L (m)", f"{mejor['L (m)']:.2f}")
-        c3.metric("h (m)", f"{mejor['h (m)']:.2f}")
-        c4.metric("Costo (S/)", f"{mejor['Costo (S/)']:.0f}")
-        st.markdown('</div>', unsafe_allow_html=True)
+# ---------- Etiqueta de cumplimiento ----------
+chip = '<span class="ok-chip">Diseño óptimo encontrado</span>'
+st.markdown(chip, unsafe_allow_html=True)
 
-        # Texto JSON elegante
-        st.markdown('<div class="mini">Resumen</div>', unsafe_allow_html=True)
-        st.json({
-            "Modelo": modelo,
-            "B (m)": round(float(mejor["B (m)"]),2),
-            "L (m)": round(float(mejor["L (m)"]),2),
-            "h (m)": round(float(mejor["h (m)"]),2),
-            "q_adm (kPa)": round(float(mejor["q_adm (kPa)"]),1),
-            "q_req (kPa)": round(float(mejor["q_req (kPa)"]),1),
-            "Costo (S/)": round(float(mejor["Costo (S/)"]),2)
-        })
+# ---------- Gráficos (Plotly, colores suaves) ----------
+pal = ["#4f46e5", "#10b981", "#22c55e", "#93c5fd", "#a78bfa"]
 
-    st.markdown('</div>', unsafe_allow_html=True)
-    st.markdown('<div class="vsep"></div>', unsafe_allow_html=True)
+# Barra q_req vs q_adm
+bar_df = pd.DataFrame({
+    "Tipo": ["q_req", "q_adm"],
+    "kPa":  [mejor["q_req (kPa)"], mejor["q_adm (kPa)"]]
+})
+bar = px.bar(
+    bar_df, x="Tipo", y="kPa",
+    color="Tipo",
+    color_discrete_sequence=[pal[0], pal[1]],
+    text="kPa",
+    title="q_req vs q_adm (óptimo)"
+)
+bar.update_traces(texttemplate="%{text:.1f}", textposition="outside")
+bar.update_layout(yaxis_title="kPa", xaxis_title="")
+# Dispersión candidatos válidos
+scatter = px.scatter(
+    df_validos, x="B (m)", y="L (m)",
+    size="h (m)", color="Costo (S/)",
+    color_continuous_scale="Tealgrn",
+    hover_data={"q_adm (kPa)":":.1f","q_req (kPa)":":.1f","h (m)":True,"Costo (S/)":":.0f"},
+    title="Candidatos válidos (color = Costo, tamaño = h)"
+)
+scatter.update_layout(legend_title_text="")
 
-    # Candidatos (Top 12)
-    if not df_validos.empty:
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.markdown('<div class="mini">Mejores candidatos por costo (Top 12)</div>', unsafe_allow_html=True)
-        top = df_validos.sort_values("Costo (S/)").head(12).reset_index(drop=True)
-        st.dataframe(
-            top.style.format({
-                "B (m)": "{:.2f}",
-                "L (m)": "{:.2f}",
-                "h (m)": "{:.2f}",
-                "q_adm (kPa)": "{:.1f}",
-                "q_req (kPa)": "{:.1f}",
-                "Costo (S/)": "{:.0f}"
-            }),
-            use_container_width=True,
-            height=340
-        )
-        st.markdown('</div>', unsafe_allow_html=True)
+c1, c2 = st.columns([1,1])
+with c1:
+    st.plotly_chart(bar, use_container_width=True)
+with c2:
+    st.plotly_chart(scatter, use_container_width=True)
 
-# ---------------------- DERECHA: GRÁFICO + IMAGEN ----------------------
-with colR:
-    st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.markdown('<div class="mini">Comparación de presiones (óptimo)</div>', unsafe_allow_html=True)
+# ---------- Resumen + recomendaciones ----------
+st.subheader("Resumen")
+res = {
+    "Modelo": modelo.split(" (")[0],
+    "B (m)": float(mejor["B (m)"]),
+    "L (m)": float(mejor["L (m)"]),
+    "h (m)": float(mejor["h (m)"]),
+    "q_adm (kPa)": float(mejor["q_adm (kPa)"]),
+    "q_req (kPa)": float(mejor["q_req (kPa)"]),
+    "Costo (S/)": float(mejor["Costo (S/)"])
+}
+st.json(res)
 
-    if df_validos.empty:
-        st.warning("No hay gráfico porque no se encontró un diseño que cumpla.", icon="⚠️")
-    else:
-        qadm = mejor["q_adm (kPa)"]
-        qreq = mejor["q_req (kPa)"]
+st.subheader("Recomendaciones")
+for tip in recomendaciones(mejor["q_req (kPa)"], mejor["q_adm (kPa)"], mejor["h (m)"], FS, mejor):
+    st.markdown(f"- {tip}")
 
-        fig, ax = plt.subplots(figsize=(5.6, 3.4))
-        bars = ax.bar(
-            ["q_req", "q_adm"],
-            [qreq, qadm],
-            width=0.55,
-            color=["#1e40af", "#10b981"]
-        )
-        ax.set_ylabel("kPa")
-        ax.set_title("q_req vs q_adm")
-        for b in bars:
-            ax.text(b.get_x()+b.get_width()/2, b.get_height()*1.01, f"{b.get_height():.1f}",
-                    ha='center', va='bottom', fontsize=9)
-        ax.grid(axis='y', alpha=0.25)
-        st.pyplot(fig, use_container_width=True)
+# ---------- Tabla de candidatos (Top 10 por costo) ----------
+st.subheader("Top 10 diseños válidos por costo")
+top10 = df_validos.sort_values("Costo (S/)").head(10)
+st.dataframe(top10.style.format({
+    "B (m)": "{:.2f}", "L (m)": "{:.2f}", "h (m)": "{:.2f}",
+    "q_adm (kPa)": "{:.1f}", "q_req (kPa)": "{:.1f}", "Costo (S/)": "{:.0f}"
+}), use_container_width=True, height=360)
 
-    st.markdown('</div>', unsafe_allow_html=True)
-
-    st.markdown('<div class="vsep"></div>', unsafe_allow_html=True)
-
-    st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.markdown('<div class="mini">Imagen adjunta</div>', unsafe_allow_html=True)
-    if up is not None:
-        st.image(up, caption="Adjunto del usuario", use_container_width=True)
-    else:
-        st.info("Puedes subir un croquis o perfil estratigráfico desde la barra lateral.", icon="🖼️")
-    st.markdown('</div>', unsafe_allow_html=True)
-
+# ---------- Imagen adjunta ----------
+st.subheader("Imagen adjunta")
+if up is not None:
+    st.image(up, caption="Croquis / Perfil estratigráfico", use_container_width=True)
+else:
+    st.info("Puedes subir un croquis o perfil estratigráfico desde la barra lateral para adjuntarlo en el informe.")
