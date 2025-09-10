@@ -1,359 +1,375 @@
-# ------------------------------------------------------------
-# Optimización de Cimentaciones - versión pro
-# ------------------------------------------------------------
+
 import io
-import math
-import base64
+import json
+from math import tan, pi, exp
+from io import BytesIO
+
 import numpy as np
 import pandas as pd
-import plotly.express as px
 import streamlit as st
+import plotly.express as px
+import plotly.graph_objects as go
+import matplotlib.pyplot as plt
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
-from reportlab.lib.units import cm
 
-# ---------------- Utils ----------------
-def pretty(x, nd=2):
-    try:
-        return float(np.round(x, nd))
-    except Exception:
-        return x
-
-def to_excel_bytes(df_dict):
-    """df_dict: {'Hoja': dataframe, ...} -> bytes de Excel"""
-    from pandas import ExcelWriter
-    buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        for name, df in df_dict.items():
-            df.to_excel(writer, sheet_name=name, index=False)
-    buf.seek(0)
-    return buf.getvalue()
-
-def pdf_bytes(resumen_texto, soluciones_top, file_name="reporte.pdf"):
-    """Crea PDF simple con ReportLab."""
-    buf = io.BytesIO()
-    c = canvas.Canvas(buf, pagesize=A4)
-    w, h = A4
-    c.setTitle("Reporte de Optimización de Cimentaciones")
-
-    # Título
-    c.setFont("Helvetica-Bold", 14)
-    c.drawString(2*cm, h-2*cm, "Optimización de Cimentaciones - Reporte")
-
-    # Resumen
-    textobject = c.beginText(2*cm, h-3.2*cm)
-    textobject.setFont("Helvetica", 10)
-    for line in resumen_texto.split("\n"):
-        textobject.textLine(line)
-    c.drawText(textobject)
-
-    # Tabla simple de top soluciones
-    y = h-9.5*cm
-    c.setFont("Helvetica-Bold", 10)
-    c.drawString(2*cm, y, "Top soluciones:")
-    y -= 0.6*cm
-
-    cols = ["B (m)", "L (m)", "h (m)", "q req (kPa)", "q adm (kPa)", "Costo (S/)"]
-    c.setFont("Helvetica", 9)
-    c.drawString(2*cm, y, " | ".join(cols))
-    y -= 0.4*cm
-
-    for _, r in soluciones_top.head(10).iterrows():
-        row_txt = " | ".join(str(pretty(r[c])) for c in cols)
-        c.drawString(2*cm, y, row_txt[:95])  # acotar
-        y -= 0.35*cm
-        if y < 2*cm:
-            c.showPage()
-            y = h-2.5*cm
-
-    c.showPage()
-    c.save()
-    buf.seek(0)
-    return buf.getvalue()
-
-# ---------------- Modelos de capacidad (simplificados) ----------------
-def Nc(phi_deg):
-    phi = np.radians(phi_deg)
-    return np.exp(np.pi * np.tan(phi)) * (np.tan(np.pi/4 + phi/2))**2
-
-def Nq(phi_deg):
-    phi = np.radians(phi_deg)
-    return np.exp(np.pi * np.tan(phi)) * (np.tan(np.pi/4 + phi/2))**2
-
-def Ngamma(phi_deg):
-    phi = np.radians(phi_deg)
-    return 2 * (Nq(phi_deg) + 1) * np.tan(phi)
-
-def q_admisible_terzaghi(c, phi, gamma, B, D, FS):
-    # Terzaghi (simplificado, zapata corrida / rectangular con factores 1)
-    q_ult = c*Nc(phi) + gamma*D*Nq(phi) + 0.5*gamma*B*Ngamma(phi)
-    return q_ult / max(FS, 1e-6)
-
-def q_admisible_simple(c, phi, gamma, B, D, FS):
-    # Modelo “rápido” y conservador
-    q_ult = 5*c + 0.5*gamma*B + gamma*D
-    return q_ult / max(FS, 1e-6)
-
-# ---------------- Sugerencias cuando no hay soluciones ----------------
-def sugerencias_sin_solucion(df_todos, N, FS,
-                             B_min, B_max, L_min, L_max, h_min, h_max,
-                             c, phi, gamma, D, modelo):
-    st.warning(
-        "No se encontraron soluciones que cumplan la capacidad admisible. "
-        "Ajusta uno o más parámetros usando estas recomendaciones."
-    )
-
-    if {"q adm (kPa)", "q req (kPa)"}.issubset(df_todos.columns):
-        tmp = df_todos.copy()
-        tmp["ratio"] = tmp["q adm (kPa)"] / (tmp["q req (kPa)"] + 1e-9)
-        best = tmp.loc[tmp["ratio"].idxmax()]
-        ratio = float(best["ratio"])
-        Bb, Ll, hh = best["B (m)"], best["L (m)"], best["h (m)"]
-        qadm, qreq = best["q adm (kPa)"], best["q req (kPa)"]
-    else:
-        ratio, Bb, Ll, hh, qadm, qreq = 0.0, B_min, L_min, h_min, 0.0, N/(B_min*L_min)
-
-    st.info(
-        f"➕ Mejor intento (NO cumple): B={pretty(Bb)} m, L={pretty(Ll)} m, h={pretty(hh)} m • "
-        f"q_req={pretty(qreq)} kPa vs q_adm={pretty(qadm)} kPa (ratio={pretty(ratio,3)})"
-    )
-
-    sugerencias = []
-
-    if ratio < 1.0:
-        factor_area = 1.0 / max(ratio, 1e-9)
-        factor_lineal = np.sqrt(factor_area)
-        B_nec = min(B_max, Bb * factor_lineal)
-        L_nec = min(L_max, Ll * factor_lineal)
-        sugerencias.append(
-            f"• Aumenta B y L. Escala lineal ≈×{pretty(factor_lineal,2)} "
-            f"(prueba B≈{pretty(B_nec)} m y L≈{pretty(L_nec)} m dentro de tus rangos)."
-        )
-
-    sugerencias.append(
-        f"• Reduce la carga N o baja el FS (p.ej. {pretty(max(1.8, FS-0.5),2)}–{pretty(max(2.0, FS-0.3),2)}) si es admisible."
-    )
-
-    if c < 25 or phi < 20:
-        sugerencias.append("• Mejorar el terreno o estrato (↑ c y/o ↑ φ).")
-
-    if D < 2.0:
-        sugerencias.append("• Aumenta la profundidad D (↑ confinamiento).")
-
-    if (B_max < 5.0) or (L_max < 5.0):
-        sugerencias.append("• Amplía los rangos B y L (hasta 5–6 m).")
-
-    sugerencias.append("• Prueba el modelo 'Simple' para un chequeo rápido (más conservador).")
-
-    st.markdown("### Recomendaciones")
-    for s in sugerencias:
-        st.markdown(s)
-
-# ---------------- Estado de ejecución ----------------
-if "run" not in st.session_state:
-    st.session_state.run = False
-
-st.set_page_config(page_title="Optimización de Cimentaciones", layout="wide")
-
-# ---------------- Sidebar: entradas ----------------
-st.sidebar.header("Parámetros de entrada")
-
-modelo = st.sidebar.selectbox(
-    "Modelo de capacidad",
-    ["Terzaghi (recomendado)", "Simple (rápido)"]
+# -------------------------- CONFIG & STYLE --------------------------
+st.set_page_config(
+    page_title="Optimización de Cimentaciones",
+    page_icon="🧱",
+    layout="wide",
 )
 
-# Presets rápidos (opcional)
-preset = st.sidebar.selectbox(
-    "Preset de suelo (rápido)",
-    [
-        "Arcilla blanda (γ=17, c=18, φ=0)",
-        "Arena densa (γ=19, c=0, φ=35)",
-        "Intermedio (γ=18, c=10, φ=25)",
-        "Personalizado"
-    ],
+PASTEL = {
+    "bg": "#f7fafc",
+    "card": "#ffffff",
+    "primary": "#2563eb",        # azul
+    "ok": "#16a34a",
+    "warn": "#c084fc",           # lila suave
+    "bar1": "#8eb5ff",
+    "bar2": "#51d0b1",
+}
+
+st.markdown(
+    f"""
+    <style>
+      .block-container {{padding-top: 1.2rem;}}
+      .stMetric > div > div > span {{font-size: 18px!important;}}
+      .stMetric > div > div {{font-size: 36px!important;}}
+      .metric-card {{
+        background: {PASTEL['card']};
+        border: 1px solid #e5e7eb; border-radius:16px; padding: 18px 22px;
+        box-shadow: 0px 5px 12px rgba(0,0,0,0.04);
+      }}
+      .pill {{
+        display:inline-block; padding:8px 14px; border-radius:999px; font-weight:600;
+      }}
+      .pill-ok {{ background:{PASTEL['ok']}; color:white; }}
+      .pill-warn {{ background:{PASTEL['warn']}; color:white; }}
+      .callout {{
+        background:#eef2ff; border-radius:12px; padding:12px 14px;
+        border:1px dashed #94a3b8;
+      }}
+      .title-accent {{ color:{PASTEL['primary']};}}
+      .kpi-title {{color:#475569; font-size:14px; margin-bottom:6px;}}
+      .kpi-value {{font-size:32px; font-weight:800; color:#0f172a;}}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+# -------------------------- HELPERS --------------------------
+
+def deg2rad(x):
+    return np.deg2rad(x)
+
+def bearing_capacity_factors(phi_deg):
+    """Nc, Nq, Nγ - factores (aprox. Terzaghi/Meyerhof)"""
+    phi = deg2rad(phi_deg)
+    if phi_deg < 0: phi = 0
+    Nq = np.exp(np.pi * np.tan(phi)) * np.tan(np.radians(45) + phi/2) ** 2
+    Nc = (Nq - 1) / np.tan(phi) if phi_deg > 0 else 5.7  # valor típico para φ≈0
+    Ngamma = 2 * (Nq + 1) * np.tan(phi)
+    return Nc, Nq, Ngamma
+
+def qu_terzaghi(gamma, c, phi_deg, B, D):
+    """Capacidad última (kPa). q = γD (sobrecarga)."""
+    Nc, Nq, Ng = bearing_capacity_factors(phi_deg)
+    q = gamma * D
+    return c*Nc + q*Nq + 0.5*gamma*B*Ng
+
+def optimize(gamma, c, phi_deg, D, N_kN, FS, B_range, L_range, h_range,
+             model="Terzaghi", concrete=650, steel=5.5):
+    """
+    Devuelve:
+      df_valid: soluciones válidas (DataFrame)
+      best: fila con mejor costo (Series) o None
+    """
+    # grid
+    B = np.linspace(*B_range)
+    L = np.linspace(*L_range)
+    H = np.linspace(*h_range)
+
+    rows = []
+    for b in B:
+        for l in L:
+            A = b*l                         # área (m2)
+            q_req = (N_kN*1000)/A           # kPa
+            qu = qu_terzaghi(gamma, c, phi_deg, b, D)
+            q_adm = qu / FS
+
+            for h in H:
+                vol = b*l*h
+                cost = vol*concrete + (b+l)*2*h*steel  # sencillo
+                ok = q_adm >= q_req
+                rows.append((b, l, h, q_adm, q_req, cost, ok))
+
+    df = pd.DataFrame(rows, columns=["B","L","h","q_adm","q_req","costo","ok"])
+    df_valid = df[df["ok"]].copy().sort_values("costo", ascending=True)
+    best = df_valid.iloc[0] if len(df_valid) else None
+    return df_valid, best
+
+def render_kpi(col, title, value):
+    with col:
+        st.markdown(f"<div class='metric-card'><div class='kpi-title'>{title}</div>"
+                    f"<div class='kpi-value'>{value}</div></div>", unsafe_allow_html=True)
+
+def make_excel(df_valid, best_row, meta):
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        pd.DataFrame([meta]).T.to_excel(writer, index=True, header=False, sheet_name="Parámetros")
+        if best_row is not None:
+            pd.DataFrame([best_row]).to_excel(writer, sheet_name="Óptimo", index=False)
+        df_valid.to_excel(writer, sheet_name="Soluciones", index=False)
+    return output.getvalue()
+
+def make_pdf(best_row, meta):
+    buffer = io.BytesIO()
+    cpdf = canvas.Canvas(buffer, pagesize=A4)
+    w, h = A4
+
+    cpdf.setFont("Helvetica-Bold", 14)
+    cpdf.drawString(40, h-60, "Optimización de Cimentaciones - Reporte")
+
+    cpdf.setFont("Helvetica", 11)
+    y = h-90
+    for k, v in meta.items():
+        cpdf.drawString(40, y, f"{k}: {v}")
+        y -= 16
+
+    if best_row is not None:
+        y -= 10
+        cpdf.setFont("Helvetica-Bold", 12)
+        cpdf.drawString(40, y, "Diseño óptimo:")
+        y -= 18
+        cpdf.setFont("Helvetica", 11)
+        cpdf.drawString(40, y, f"B = {best_row['B']:.2f} m, L = {best_row['L']:.2f} m, h = {best_row['h']:.2f} m")
+        y -= 16
+        cpdf.drawString(40, y, f"q_req = {best_row['q_req']:.1f} kPa, q_adm = {best_row['q_adm']:.1f} kPa")
+        y -= 16
+        cpdf.drawString(40, y, f"Costo = S/ {best_row['costo']:.0f}")
+
+    cpdf.showPage()
+    cpdf.save()
+    buffer.seek(0)
+    return buffer.read()
+
+def sketch(b, l, h):
+    fig, ax = plt.subplots(figsize=(4, 2.2), dpi=130)
+    ax.add_patch(plt.Rectangle((0, 0), b, l, edgecolor="#0f172a", facecolor="#c7d2fe", lw=2))
+    ax.set_xlim(0, max(b*1.15, 0.5))
+    ax.set_ylim(0, max(l*1.15, 0.5))
+    ax.set_aspect("equal")
+    ax.set_xlabel("B (m)")
+    ax.set_ylabel("L (m)")
+    ax.set_title(f"Esquema (h={h:.2f} m)")
+    ax.grid(alpha=0.25)
+    st.pyplot(fig, use_container_width=True)
+    plt.close(fig)
+
+# -------------------------- SIDEBAR --------------------------
+
+st.sidebar.header("Parámetros de entrada")
+
+model = st.sidebar.selectbox(
+    "Modelo de capacidad",
+    ["Terzaghi (recomendado)"],
     index=0
 )
 
-# Valores por defecto del preset
-p_gamma, p_c, p_phi = 17.0, 18.0, 0.0
-if preset == "Arena densa (γ=19, c=0, φ=35)":
-    p_gamma, p_c, p_phi = 19.0, 0.0, 35.0
-elif preset == "Intermedio (γ=18, c=10, φ=25)":
-    p_gamma, p_c, p_phi = 18.0, 10.0, 25.0
+# Presets de suelo
+SOILS = {
+    "Arcilla blanda (γ=17, c=18, φ=0)": (17.0, 18.0, 0.0),
+    "Arena densa (γ=20, c=0, φ=35)": (20.0, 0.0, 35.0),
+    "Arcilla media (γ=18.5, c=30, φ=5)": (18.5, 30.0, 5.0),
+}
+preset = st.sidebar.selectbox("Preset de suelo (rápido)", list(SOILS.keys()), index=0)
+gamma_default, c_default, phi_default = SOILS[preset]
 
-gamma = st.sidebar.number_input("Peso unitario γ (kN/m³)", 15.0, 24.0, value=float(p_gamma), step=0.5)
-c     = st.sidebar.number_input("Cohesión c (kPa)", 0.0, 200.0, value=float(p_c), step=1.0)
-phi   = st.sidebar.number_input("Ángulo de fricción φ (°)", 0.0, 45.0, value=float(p_phi), step=1.0)
-D     = st.sidebar.number_input("Profundidad D (m)", 0.0, 5.0, value=1.5, step=0.1)
-N     = st.sidebar.number_input("Carga N (kN)", 100.0, 6000.0, value=1000.0, step=50.0)
-FS    = st.sidebar.number_input("Factor de seguridad", 1.5, 4.0, value=2.5, step=0.1)
+gamma = st.sidebar.number_input("Peso unitario γ (kN/m³)", 10.0, 25.0, gamma_default, 0.25)
+c = st.sidebar.number_input("Cohesión c (kPa)", 0.0, 300.0, c_default, 1.0)
+phi = st.sidebar.number_input("Ángulo de fricción φ (°)", 0.0, 45.0, phi_default, 0.5)
+D = st.sidebar.number_input("Profundidad D (m)", 0.0, 5.0, 1.50, 0.05)
+N_kN = st.sidebar.number_input("Carga N (kN)", 50.0, 10000.0, 1000.0, 10.0)
+FS = st.sidebar.number_input("Factor de seguridad", 1.5, 5.0, 2.5, 0.1)
 
-st.sidebar.markdown("---")
-st.sidebar.subheader("Rangos de búsqueda")
-B_min, B_max = st.sidebar.slider("Base B (m)", 1.0, 6.0, (1.2, 4.0), step=0.1)
-L_min, L_max = st.sidebar.slider("Largo L (m)", 1.0, 6.0, (1.2, 4.0), step=0.1)
-h_min, h_max = st.sidebar.slider("Altura h (m)", 0.4, 1.5, (0.6, 1.0), step=0.05)
+st.sidebar.subheader("Costos")
+concrete = st.sidebar.number_input("Concreto (S/ por m³)", 300.0, 2000.0, 650.0, 10.0)
+steel = st.sidebar.number_input("Acero (S/ por kg)", 3.0, 12.0, 5.50, 0.1)
 
-# Upload opcional
-st.sidebar.markdown("---")
+st.sidebar.subheader("Rangos de diseño")
+B_range = (1.0, 3.8, 25)   # min, max, puntos
+L_range = (1.0, 3.8, 25)
+h_range = (0.5, 1.2, 8)
+
 st.sidebar.subheader("Adjuntos")
-img_file = st.sidebar.file_uploader("Sube croquis/perfil (PNG/JPG)", type=["png","jpg","jpeg"])
+user_img = st.sidebar.file_uploader("Sube una imagen (perfil del suelo, croquis)", type=["png", "jpg", "jpeg"])
 
-st.sidebar.markdown("---")
+# Botón de correr
 if st.sidebar.button("🔎 Analizar y optimizar"):
     st.session_state.run = True
-    st.experimental_rerun()
+    st.rerun()  # <- reemplazo correcto
 
-# ---------------- Cabecera ----------------
-st.title("Optimización de Cimentaciones")
+# -------------------------- TÍTULO --------------------------
+
+st.markdown(
+    "<h1 class='title-accent'>Optimización de Cimentaciones</h1>",
+    unsafe_allow_html=True,
+)
 st.caption("Diseño óptimo por costo cumpliendo capacidad admisible — vista compacta")
 
-if not st.session_state.run:
-    st.info("Configura los parámetros a la izquierda y pulsa **Analizar y optimizar**.")
-    st.stop()
+# -------------------------- LÓGICA --------------------------
 
-# ---------------- Cálculo ----------------
-with st.spinner("Calculando candidatos..."):
-    # Mallas
-    B_vals = np.round(np.linspace(B_min, B_max, 16), 2)
-    L_vals = np.round(np.linspace(L_min, L_max, 16), 2)
-    h_vals = np.round(np.linspace(h_min, h_max, 9), 2)
+run = st.session_state.get("run", False)
+relax = st.session_state.get("relax", False)
 
-    rows = []
-    for B in B_vals:
-        for L in L_vals:
-            for h in h_vals:
-                area = B*L
-                q_req = N / max(area, 1e-9)  # kPa (asumiendo kN/m2 ~ kPa)
-                if modelo.startswith("Terzaghi"):
-                    q_adm = q_admisible_terzaghi(c, phi, gamma, B, D, FS)
-                else:
-                    q_adm = q_admisible_simple(c, phi, gamma, B, D, FS)
-                cumple = q_adm >= q_req
-                # costo simplificado = volumen hormigón + penalización acero ~ h*B*L + 30*h
-                costo = 650*B*L*h + 30*h
-                rows.append([B, L, h, q_req, q_adm, costo, cumple])
-
-    df = pd.DataFrame(rows, columns=["B (m)","L (m)","h (m)","q req (kPa)","q adm (kPa)","Costo (S/)","Cumple"])
-    df_validos = df[df["Cumple"]==True].copy()
-
-# ---------------- Si no hay soluciones -> sugerencias y auto-ajuste ----------------
-if df_validos.empty:
-    sugerencias_sin_solucion(
-        df_todos=df, N=N, FS=FS,
-        B_min=B_min, B_max=B_max, L_min=L_min, L_max=L_max, h_min=h_min, h_max=h_max,
-        c=c, phi=phi, gamma=gamma, D=D, modelo=modelo
+if run:
+    df_valid, best = optimize(
+        gamma, c, phi, D, N_kN, FS,
+        (B_range[0], B_range[1], B_range[2]),
+        (L_range[0], L_range[1], L_range[2]),
+        (h_range[0], h_range[1], h_range[2]),
+        model="Terzaghi", concrete=concrete, steel=steel
     )
 
-    colA, colB = st.columns(2)
-    with colA:
-        if st.button("🪄 Auto-ajustar y reintentar"):
-            # Relaja FS y amplía 20% los rangos si es posible
-            st.session_state.run = True
-            st.session_state.relax = True
-            st.experimental_rerun()
-    with colB:
-        st.info("Consejo: reduce FS en 0.25 y/o aumenta máximos de B y L un 20% y vuelve a intentar.")
-    st.stop()
+    if best is None:
+        st.info(
+            "No se encontraron soluciones que cumplan la capacidad admisible. "
+            "Prueba con **B y L mayores**, **φ o c más altos**, **FS menor** o **carga menor**."
+        )
+        colA, colB = st.columns([1, 1])
+        with colA:
+            if st.button("🪄 Auto-ajustar y reintentar"):
+                st.session_state.run = True
+                st.session_state.relax = True
+                st.rerun()  # <- reemplazo correcto
+        with colB:
+            st.markdown(
+                "<div class='callout'>Sugerencia rápida: prueba con B y L en el rango 1.4–4.0 m.</div>",
+                unsafe_allow_html=True,
+            )
 
-# Auto-ajuste si fue solicitado
-if st.session_state.get("relax", False):
-    st.session_state.relax = False
-    FS = max(1.5, FS-0.25)
-    B_max = min(6.0, B_max*1.2)
-    L_max = min(6.0, L_max*1.2)
-    st.info(f"Se aplicó auto-ajuste: FS={pretty(FS)}, B_max={pretty(B_max)}, L_max={pretty(L_max)}. Pulsa de nuevo **Analizar y optimizar**.")
-    st.stop()
+    else:
+        # Métricas principales
+        c1, c2, c3, c4 = st.columns([1, 1, 1, 1])
+        render_kpi(c1, "B (m)", f"{best['B']:.2f}")
+        render_kpi(c2, "L (m)", f"{best['L']:.2f}")
+        render_kpi(c3, "h (m)", f"{best['h']:.2f}")
+        render_kpi(c4, "Costo (S/)", f"{best['costo']:.0f}")
 
-# ---------------- Óptimo y KPIs ----------------
-df_validos["Score"] = df_validos["Costo (S/)"]  # minimizar costo
-opt = df_validos.loc[df_validos["Score"].idxmin()].copy()
+        st.markdown("<span class='pill pill-ok'>Diseño óptimo encontrado</span>", unsafe_allow_html=True)
+        st.markdown("<hr>", unsafe_allow_html=True)
 
-kpi_cols = st.columns(4)
-kpi_cols[0].metric("B (m)", pretty(opt["B (m)"]))
-kpi_cols[1].metric("L (m)", pretty(opt["L (m)"]))
-kpi_cols[2].metric("h (m)", pretty(opt["h (m)"]))
-kpi_cols[3].metric("Costo (S/)", int(round(opt["Costo (S/)"])))
+        # ----------------- Gráficos (Plotly con colores suaves) -----------------
+        left, right = st.columns([1, 1])
 
-st.success("✅ Diseño óptimo encontrado")
+        with left:
+            fig_bar = go.Figure()
+            fig_bar.add_trace(go.Bar(
+                x=["q_req"], y=[best["q_req"]],
+                name="q_req", marker_color=PASTEL["bar1"], text=[f"{best['q_req']:.1f}"],
+                textposition="outside"
+            ))
+            fig_bar.add_trace(go.Bar(
+                x=["q_adm"], y=[best["q_adm"]],
+                name="q_adm", marker_color=PASTEL["bar2"], text=[f"{best['q_adm']:.1f}"],
+                textposition="outside"
+            ))
+            fig_bar.update_layout(
+                title="q_req vs q_adm (óptimo)",
+                yaxis_title="kPa", bargap=0.35, template="plotly_white",
+                legend_title_text="", height=420
+            )
+            st.plotly_chart(fig_bar, use_container_width=True)
 
-# ---------------- Gráficos principales ----------------
-c1, c2 = st.columns(2)
-with c1:
-    fig = px.bar(
-        pd.DataFrame({
-            "Tipo":["q_req","q_adm"],
-            "kPa":[opt["q req (kPa)"], opt["q adm (kPa)"]]
-        }),
-        x="Tipo", y="kPa", title="q_req vs q_adm (óptimo)",
-        color="Tipo", color_discrete_sequence=px.colors.sequential.Tealgrn
+        with right:
+            df_show = df_valid.copy()
+            fig_sc = px.scatter(
+                df_show, x="B", y="L", color="costo", size="h",
+                title="Candidatos válidos (color = Costo, tamaño = h)",
+                template="plotly_white", color_continuous_scale=px.colors.sequential.Tealgrn,
+                height=420,
+            )
+            fig_sc.update_traces(marker=dict(line=dict(width=0)))
+            st.plotly_chart(fig_sc, use_container_width=True)
+
+        # ----------------- Resumen JSON -----------------
+        st.subheader("Resumen")
+        summary = {
+            "Modelo": "Terzaghi",
+            "B (m)": float(best["B"]),
+            "L (m)": float(best["L"]),
+            "h (m)": float(best["h"]),
+            "q_adm (kPa)": float(best["q_adm"]),
+            "q_req (kPa)": float(best["q_req"]),
+            "Costo (S/)": float(best["costo"]),
+        }
+        st.code(json.dumps(summary, indent=2, ensure_ascii=False))
+
+        # ----------------- Recomendaciones -----------------
+        st.subheader("Recomendaciones")
+        st.markdown(
+            f"""
+            - ✅ **Buen diseño**: margen suficiente entre capacidad y demanda.
+            - 💡 **Óptimo actual**: S/ **{best['costo']:.0f}**. Evalúa alternativas con **h** ligeramente mayor si buscas rigidez.
+            - 📐 Verifica asentamientos y punzonamiento si aplica.
+            """,
+        )
+        with st.expander("Referencias clave"):
+            st.markdown(
+                "- Terzaghi & Peck (1997) – Capacidad portante clásica.  \n"
+                "- Meyerhof (1963); Vesic (1973) – Factores N y correcciones.  \n"
+                "- Normas locales para factores de reducción y FS."
+            )
+
+        # ----------------- Tabla de soluciones & descargas -----------------
+        st.subheader("Soluciones válidas (Top 200 por costo)")
+        df_top = df_valid.sort_values("costo").head(200).reset_index(drop=True)
+        st.dataframe(df_top, use_container_width=True, hide_index=True)
+
+        meta = {
+            "γ (kN/m³)": gamma,
+            "c (kPa)": c,
+            "φ (°)": phi,
+            "D (m)": D,
+            "N (kN)": N_kN,
+            "FS": FS,
+            "Concreto": concrete,
+            "Acero": steel,
+        }
+
+        colx, coly = st.columns([1, 1])
+        with colx:
+            xls_bytes = make_excel(df_top, best, meta)
+            st.download_button(
+                "📥 Descargar Excel",
+                data=xls_bytes,
+                file_name="reporte_cimentacion.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        with coly:
+            pdf_bytes = make_pdf(best, meta)
+            st.download_button(
+                "📄 Descargar reporte (PDF)",
+                data=pdf_bytes,
+                file_name="reporte_cimentacion.pdf",
+                mime="application/pdf",
+            )
+
+        # ----------------- Esquema & Adjuntos -----------------
+        st.subheader("Esquema del óptimo")
+        sketch(float(best["B"]), float(best["L"]), float(best["h"]))
+
+        if user_img is not None:
+            st.subheader("Imagen adjunta")
+            st.image(user_img, caption="Adjunto del usuario", use_container_width=True)
+
+else:
+    st.markdown(
+        "<div class='callout'>Configura los parámetros a la izquierda y pulsa "
+        "<b>Analizar y optimizar</b>.</div>",
+        unsafe_allow_html=True,
     )
-    fig.update_layout(showlegend=False, height=380)
-    st.plotly_chart(fig, use_container_width=True)
-
-with c2:
-    fig2 = px.scatter(
-        df_validos, x="B (m)", y="L (m)",
-        size="h (m)", color="Costo (S/)",
-        color_continuous_scale=px.colors.sequential.Teal,
-        title="Candidatos válidos (color = Costo, tamaño = h)"
-    )
-    fig2.update_layout(height=380)
-    st.plotly_chart(fig2, use_container_width=True)
-
-# ---------------- Tabla de soluciones y export ----------------
-st.subheader("Soluciones válidas")
-df_show = df_validos.sort_values("Costo (S/)").head(200).copy()
-st.dataframe(df_show, use_container_width=True, hide_index=True)
-
-colx, coly = st.columns(2)
-
-with colx:
-    xls = to_excel_bytes({"Top": df_show, "Óptimo": pd.DataFrame([opt])})
-    st.download_button(
-        "📥 Descargar Excel",
-        data=xls, file_name="cimentaciones_resultados.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    )
-
-with coly:
-    resumen = (
-        f"Modelo: {modelo}\n"
-        f"γ={pretty(gamma)} kN/m³, c={pretty(c)} kPa, φ={pretty(phi)}°, D={pretty(D)} m, N={pretty(N)} kN, FS={pretty(FS)}\n"
-        f"Óptimo: B={pretty(opt['B (m)'])} m, L={pretty(opt['L (m)'])} m, h={pretty(opt['h (m)'])} m, "
-        f"q_req={pretty(opt['q req (kPa)'])} kPa, q_adm={pretty(opt['q adm (kPa)'])} kPa, "
-        f"Costo=S/ {int(round(opt['Costo (S/)']))}"
-    )
-    pdfbin = pdf_bytes(resumen, df_show, "reporte.pdf")
-    st.download_button("🧾 Descargar reporte (PDF)", data=pdfbin, file_name="reporte_cimentaciones.pdf", mime="application/pdf")
-
-# ---------------- Esquema óptimo ----------------
-st.subheader(f"Esquema (h = {pretty(opt['h (m)'])} m)")
-Bopt, Lopt, hopt = float(opt["B (m)"]), float(opt["L (m)"]), float(opt["h (m)"])
-fig3 = px.imshow(
-    np.ones((int(max(1, hopt*100)), int(max(1, Bopt*100))))*0.9,
-    color_continuous_scale=[[0,"#e9f5f2"],[1,"#9fd6cc"]],
-    origin="lower"
-)
-fig3.update_layout(coloraxis_showscale=False, margin=dict(l=10,r=10,t=10,b=10), height=250)
-fig3.update_xaxes(showticklabels=False)
-fig3.update_yaxes(showticklabels=False)
-st.plotly_chart(fig3, use_container_width=True)
-
-# Imagen adjunta (opcional)
-if img_file is not None:
-    st.subheader("Imagen adjunta")
-    st.image(img_file, use_container_width=True, caption="Adjunto del usuario")
-
-# ---------------- Recomendaciones finales ----------------
-st.subheader("Recomendaciones")
-st.markdown(
-    f"✅ **Buen diseño:** margen suficiente entre capacidad y demanda.\n\n"
-    f"💡 **Óptimo actual:** S/ {int(round(opt['Costo (S/)']))}. "
-    f"Si necesitas más rigidez, evalúa alternativas con **h** ligeramente mayor.\n\n"
-    "📚 **Referencias clave:** Terzaghi & Peck; Meyerhof; Vesic (capacidad portante clásica).\n"
-)
-
 
      
+
