@@ -1,11 +1,11 @@
 streamlit
 numpy
 pandas
-matplotlib
 plotly>=5.22
-reportlab
 xlsxwriter
-openpyxl
+reportlab
+
+
 
 
 
