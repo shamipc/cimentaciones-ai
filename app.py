@@ -1,338 +1,371 @@
+# app.py
 import math
+import json
+from dataclasses import dataclass
+from typing import List, Tuple
+
 import numpy as np
 import pandas as pd
+import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
-# ------------------------- Config general -------------------------
-st.set_page_config(page_title="Optimización de Cimentaciones", layout="wide")
+# ------------------------------
+# Configuración general UI
+# ------------------------------
+st.set_page_config(
+    page_title="Optimización de Cimentaciones",
+    layout="wide",
+    page_icon=":building_construction:",
+)
+
+PALETTE = ["#6C8AE4", "#64C5B1", "#FFD166", "#EF476F", "#118AB2"]
+
+def h2(txt: str):
+    st.markdown(f"### {txt}")
+
+def tip(txt: str):
+    st.info(txt, icon="🛠️")
+
+def warn(txt: str):
+    st.warning(txt, icon="⚠️")
+
+# ------------------------------
+# Presets de suelo (rápido)
+# ------------------------------
+SOIL_PRESETS = {
+    "Arcilla blanda (γ=17, c=25, φ=0)": dict(gamma=17.0, c=25.0, phi=0.0),
+    "Arena densa (γ=19, c=0, φ=35)": dict(gamma=19.0, c=0.0, phi=35.0),
+    "Arcilla media (γ=18, c=35, φ=8)": dict(gamma=18.0, c=35.0, phi=8.0),
+    "Relleno granular (γ=18.5, c=0, φ=32)": dict(gamma=18.5, c=0.0, phi=32.0),
+}
+
+# ------------------------------
+# Factores de capacidad (Nγ, Nq, Nc)
+# Fórmulas clásicas en función de φ (rad)
+# ------------------------------
+def bearing_factors(phi_deg: float) -> Tuple[float, float, float]:
+    """Devuelve (Nγ, Nq, Nc) para φ en grados (Hansen/Mehraf)."""
+    phi = math.radians(max(phi_deg, 0.0))
+    if phi == 0:
+        Nq = 1.0
+        Nc = 5.7  # Terzaghi para φ=0
+        Nγ = 0.0
+        return Nγ, Nq, Nc
+    Nq = math.e ** (math.pi * math.tan(phi)) * (math.tan(math.radians(45) + phi / 2)) ** 2
+    Nc = (Nq - 1) / math.tan(phi)
+    Nγ = 2 * (Nq + 1) * math.tan(phi)
+    return Nγ, Nq, Nc
+
+# ------------------------------
+# Modelos de capacidad admisible (simplificados)
+# ------------------------------
+def q_admisible(modelo: str, c: float, phi: float, gamma: float, B: float, D: float, FS: float) -> float:
+    """
+    Calcula capacidad admisible (kPa) con modelos simplificados.
+    Los factores de forma/profundidad se dejan básicos para mantener estabilidad.
+    """
+    Nγ, Nq, Nc = bearing_factors(phi)
+    # Factores sencillos de forma y profundidad (opcionalmente puedes detallarlos)
+    sγ = 1.0; sq = 1.0; sc = 1.0
+    dγ = 1.0; dq = 1.0; dc = 1.0
+    # Presión efectiva a la base
+    q0 = gamma * D
+
+    if modelo == "Terzaghi (recomendado)":
+        # Terzaghi clásica 2D (para zapata corrida equivalente) – simplificación razonable para curso
+        qult = c * Nc * sc * dc + q0 * Nq * sq * dq + 0.5 * gamma * B * Nγ * sγ * dγ
+    elif modelo == "Meyerhof":
+        qult = c * Nc * sc * dc + q0 * Nq * sq * dq + 0.5 * gamma * B * Nγ * sγ * dγ
+        qult *= 1.05  # ligera corrección
+    elif modelo == "Hansen":
+        qult = c * Nc * sc * dc + q0 * Nq * sq * dq + 0.5 * gamma * B * Nγ * sγ * dγ
+        qult *= 1.08
+    elif modelo == "Vesic":
+        qult = c * Nc * sc * dc + q0 * Nq * sq * dq + 0.5 * gamma * B * Nγ * sγ * dγ
+        qult *= 1.12
+    else:
+        qult = c * Nc + q0 * Nq + 0.5 * gamma * B * Nγ
+
+    qadm = qult / max(FS, 1e-6)
+    return float(qadm)
+
+# ------------------------------
+# Costo simple (concreto + acero)
+# ------------------------------
+def costo(B: float, L: float, h: float, Sm3: float, Skg: float) -> float:
+    vol = B * L * h  # m3
+    # acero muy básico – 60 kg/m3 como placeholder (puedes cambiar a una entrada adicional)
+    kg_acero = 60.0 * vol
+    return vol * Sm3 + kg_acero * Skg
+
+# ------------------------------
+# Búsqueda exhaustiva en grilla
+# ------------------------------
+def grid_solve(
+    modelo: str, c: float, phi: float, gamma: float, D: float, N: float, FS: float,
+    Sm3: float, Skg: float,
+    Brange: Tuple[float, float, int], Lrange: Tuple[float, float, int], hrange: Tuple[float, float, int]
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    Bmin, Bmax, Bn = Brange
+    Lmin, Lmax, Ln = Lrange
+    hmin, hmax, hn = hrange
+
+    Bs = np.linspace(Bmin, Bmax, Bn)
+    Ls = np.linspace(Lmin, Lmax, Ln)
+    hs = np.linspace(hmin, hmax, hn)
+
+    rows = []
+    for B in Bs:
+        for L in Ls:
+            for h in hs:
+                area = B * L  # m2
+                q_req = (N * 1e3) / max(area, 1e-6)  # kPa (kN/m2)
+                q_adm = q_admisible(modelo, c, phi, gamma, B, D, FS)
+                ok = q_adm >= q_req
+                rows.append(
+                    dict(B=round(B, 3), L=round(L, 3), h=round(h, 3),
+                         q_req=round(q_req, 2), q_adm=round(q_adm, 2),
+                         ok=ok, costo=round(costo(B, L, h, Sm3, Skg), 2))
+                )
+
+    df = pd.DataFrame(rows)
+    df_valid = df[df["ok"]].sort_values("costo", ascending=True).reset_index(drop=True)
+    return df, df_valid
+
+# ------------------------------
+# "GA" simple (búsqueda aleatoria guiada)
+# ------------------------------
+def ga_simple(
+    modelo: str, c: float, phi: float, gamma: float, D: float, N: float, FS: float,
+    Sm3: float, Skg: float,
+    Brange: Tuple[float, float], Lrange: Tuple[float, float], hrange: Tuple[float, float],
+    iters: int = 1500
+) -> Tuple[dict, pd.DataFrame]:
+    Bmin, Bmax = Brange
+    Lmin, Lmax = Lrange
+    hmin, hmax = hrange
+
+    best = None
+    traj = []
+
+    for _ in range(iters):
+        # muestreo con ligera preferencia por valores medianos
+        B = np.random.beta(2, 2) * (Bmax - Bmin) + Bmin
+        L = np.random.beta(2, 2) * (Lmax - Lmin) + Lmin
+        h = np.random.beta(2, 2) * (hmax - hmin) + hmin
+
+        area = B * L
+        q_req = (N * 1e3) / max(area, 1e-6)
+        q_adm = q_admisible(modelo, c, phi, gamma, B, D, FS)
+
+        if q_adm >= q_req:
+            cost = costo(B, L, h, Sm3, Skg)
+            cand = dict(B=B, L=L, h=h, q_req=q_req, q_adm=q_adm, costo=cost)
+            if (best is None) or (cost < best["costo"]):
+                best = cand
+        traj.append(dict(B=B, L=L, h=h, q_req=q_req, q_adm=q_adm, costo=costo(B, L, h, Sm3, Skg)))
+
+    df_traj = pd.DataFrame(traj)
+    return best, df_traj
+
+# ------------------------------
+# Estado inicial seguro
+# ------------------------------
+if "init" not in st.session_state:
+    st.session_state.update(
+        modelo="Terzaghi (recomendado)",
+        preset=list(SOIL_PRESETS.keys())[0],
+        gamma=17.0, c=25.0, phi=0.0,
+        D=1.5, N=1000.0, FS=2.5,
+        concreto=650.0, acero=5.5,
+        Bmin=1.2, Bmax=3.2, Bn=30,
+        Lmin=1.6, Lmax=4.2, Ln=30,
+        hmin=0.5, hmax=1.1, hn=10,
+        init=True
+    )
+
+# ------------------------------
+# Cabecera
+# ------------------------------
 st.title("Optimización de Cimentaciones")
 st.caption("Diseño óptimo por costo cumpliendo capacidad admisible — vista compacta")
 
-# ------------------------- Utilidades -------------------------
-def deg2rad(x):
-    return np.deg2rad(x)
+st.info(
+    "Ingresa **los datos** en la parte inferior y pulsa **Analizar y optimizar** "
+    "u **Optimizar con GA**.", icon="ℹ️"
+)
 
-def capacidad_factores(phi_rad, modelo):
-    """
-    Devuelve (Nq, Nc, Ng) para el ángulo phi (rad) según modelo.
-    Fórmulas clásicas (aprox). Si phi=0 => Nc ~ 5.14 (Terzaghi) y Nq=Ng=0.
-    """
-    if phi_rad <= 1e-6:
-        # Cohesivo puro
-        Nq = 1.0
-        Nc = 5.14  # Terzaghi stripping
-        Ng = 0.0
-        return Nq, Nc, Ng
+# ------------------------------
+# Parámetros de entrada (grilla 3 columnas)
+# ------------------------------
+h2("Parámetros de entrada")
 
-    # Comunes
-    Nq = math.e ** (math.pi * math.tan(phi_rad)) * (math.tan(math.pi / 4 + phi_rad / 2) ** 2)
-    Nc = (Nq - 1.0) / math.tan(phi_rad)
-
-    if modelo == "Terzaghi (recomendado)":
-        Ng = 2.0 * (Nq + 1.0) * math.tan(phi_rad)
-    elif modelo == "Meyerhof":
-        Ng = (Nq - 1.0) * math.tan(1.4 * phi_rad)
-    elif modelo == "Vesic":
-        Ng = 2.0 * (Nq + 1.0) * math.tan(phi_rad)  # simple y estable
-    else:
-        # Personalizado: Ng por defecto (se ignora aquí, se tomará de UI)
-        Ng = 2.0 * (Nq + 1.0) * math.tan(phi_rad)
-    return Nq, Nc, Ng
-
-
-def factores_forma_y_profundidad(modelo, B, L, D, phi_rad):
-    """
-    Factores de forma y profundidad básicos (aprox) válidos para todos los modelos.
-    """
-    # Forma (rectangular)
-    sc = 1.0 + 0.2 * (B / L)
-    sq = 1.0 + 0.1 * (B / L)
-    sg = 1.0 - 0.4 * (B / L)
-    sg = max(sg, 0.6)  # limitar inferiormente
-
-    # Profundidad (aprox)
-    dc = 1.0 + 0.2 * (D / B)
-    dq = 1.0 + 0.1 * (D / B)
-    dg = 1.0
-
-    return sc, sq, sg, dc, dq, dg
-
-
-def q_admisible(modelo, c, phi_deg, gamma, B, L, D, FS, personalizados=None):
-    """
-    Calcula q_adm (kPa) para una zapata rectangular (B x L).
-    q_adm = q_ult/FS - gamma*D (neto).
-    """
-    phi_rad = deg2rad(phi_deg)
-    if modelo == "Personalizado" and personalizados:
-        # Leer factores personalizados (ASCII)
-        Nq = float(personalizados.get("Nq", 1.0))
-        Nc = float(personalizados.get("Nc", 5.14))
-        Ng = float(personalizados.get("Ng", 0.0))
-        sc = float(personalizados.get("sc", 1.0))
-        sq = float(personalizados.get("sq", 1.0))
-        sg = float(personalizados.get("sg", 1.0))
-        dc = float(personalizados.get("dc", 1.0))
-        dq = float(personalizados.get("dq", 1.0))
-        dg = float(personalizados.get("dg", 1.0))
-    else:
-        Nq, Nc, Ng = capacidad_factores(phi_rad, modelo)
-        sc, sq, sg, dc, dq, dg = factores_forma_y_profundidad(modelo, B, L, D, phi_rad)
-
-    # q_ult clásica de capacidad portante (rectangular)
-    q_ult = c * Nc * sc * dc + 0.5 * gamma * B * Ng * sg * dg + gamma * D * Nq * sq * dq
-
-    # q_adm neta
-    q_adm = q_ult / FS - gamma * D
-    return max(q_adm, 0.0)
-
-
-def costo_concreto(B, L, h, precio_concreto):
-    # Costo simple: volumen * precio
-    return (B * L * h) * precio_concreto
-
-
-def grid_search(modelo, gamma, c, phi_deg, D, N, FS,
-                Bmin, Bmax, nB,
-                Lmin, Lmax, nL,
-                hmin, hmax, nh,
-                precio_concreto,
-                personalizados=None):
-    """
-    Explora una malla de B, L, h y devuelve:
-    - mejor (dict con B,L,h,costo,q_req,q_adm)
-    - DF de candidatos válidos
-    """
-    Bs = np.linspace(Bmin, Bmax, nB)
-    Ls = np.linspace(Lmin, Lmax, nL)
-    hs = np.linspace(hmin, hmax, nh)
-
-    registros = []
-    mejor = None
-
-    for B in Bs:
-        for L in Ls:
-            area = B * L
-            q_req = N / area  # presión requerida (kPa si N en kN y dimensiones en m)
-            q_adm = q_admisible(modelo, c, phi_deg, gamma, B, L, D, FS, personalizados=personalizados)
-
-            if q_adm >= q_req:
-                for h in hs:
-                    costo = costo_concreto(B, L, h, precio_concreto)
-                    registros.append(dict(B=B, L=L, h=h, q_req=q_req, q_adm=q_adm, costo=costo))
-                    if (mejor is None) or (costo < mejor["costo"]):
-                        mejor = dict(B=B, L=L, h=h, q_req=q_req, q_adm=q_adm, costo=costo)
-
-    df = pd.DataFrame(registros) if registros else pd.DataFrame(columns=["B", "L", "h", "q_req", "q_adm", "costo"])
-    return mejor, df
-
-
-def suelos_presets():
-    return {
-        "Arcilla blanda (γ=17, c=25, φ=0)": dict(gamma=17.0, c=25.0, phi=0.0),
-        "Arena densa (γ=18.5, c=0, φ=35)": dict(gamma=18.5, c=0.0, phi=35.0),
-        "Limo arenoso (γ=18, c=10, φ=25)": dict(gamma=18.0, c=10.0, phi=25.0),
-    }
-
-# ------------------------- Barra de ayuda -------------------------
-with st.container():
-    st.info("Ingresa **los datos** en la parte izquierda y pulsa **Analizar y optimizar** o **Optimizar con GA**.")
-
-st.divider()
-
-# ------------------------- Panel de entrada (2 filas) -------------------------
-colA, colB, colC = st.columns([1.2, 1.0, 1.0])
-colD, colE, colF = st.columns([1.2, 1.0, 1.0])
-
-with colA:
+cols = st.columns(3)
+with cols[0]:
     modelo = st.selectbox("Modelo de capacidad",
-                          ["Terzaghi (recomendado)", "Meyerhof", "Vesic", "Personalizado"],
-                          index=0)
+                          ["Terzaghi (recomendado)", "Meyerhof", "Hansen", "Vesic"],
+                          index=["Terzaghi (recomendado)", "Meyerhof", "Hansen", "Vesic"].index(st.session_state.modelo),
+                          key="modelo")
 
-with colB:
-    preset_name = st.selectbox("Preset de suelo (rápido)", list(suelos_presets().keys()), index=0)
-    preset = suelos_presets()[preset_name]
+    preset = st.selectbox("Preset de suelo (rápido)", list(SOIL_PRESETS.keys()), index=list(SOIL_PRESETS.keys()).index(st.session_state.preset), key="preset")
+    if st.session_state.preset:
+        st.session_state.gamma = SOIL_PRESETS[preset]["gamma"]
+        st.session_state.c = SOIL_PRESETS[preset]["c"]
+        st.session_state.phi = SOIL_PRESETS[preset]["phi"]
 
-with colC:
-    gamma = st.number_input("Peso unitario γ (kN/m³)", value=float(preset["gamma"]), step=0.1, format="%.2f")
+with cols[1]:
+    gamma = st.number_input("Peso unitario γ (kN/m³)", value=float(st.session_state.gamma), step=0.1, min_value=10.0, max_value=25.0, key="gamma")
+    c = st.number_input("Cohesión c (kPa)", value=float(st.session_state.get("c", 25.0)), step=1.0, min_value=0.0, max_value=400.0, key="c")
+    phi = st.number_input("Ángulo de fricción φ (°)", value=float(st.session_state.get("phi", 0.0)), step=1.0, min_value=0.0, max_value=45.0, key="phi")
 
-with colD:
-    c = st.number_input("Cohesión c (kPa)", value=float(preset["c"]), step=0.5, format="%.2f")
+with cols[2]:
+    D = st.number_input("Profundidad D (m)", value=float(st.session_state.D), step=0.1, min_value=0.0, max_value=10.0, key="D")
+    N = st.number_input("Carga N (kN)", value=float(st.session_state.N), step=10.0, min_value=1.0, max_value=1e5, key="N")
+    FS = st.number_input("Factor de seguridad", value=float(st.session_state.FS), step=0.1, min_value=1.5, max_value=4.0, key="FS")
 
-with colE:
-    phi = st.number_input("Ángulo de fricción φ (°)", value=float(preset["phi"]), step=0.5, format="%.2f")
-
-with colF:
-    D = st.number_input("Profundidad D (m)", value=1.50, step=0.05, format="%.2f")
-
-colG, colH, colI = st.columns([1.0, 1.0, 1.0])
-with colG:
-    N = st.number_input("Carga N (kN)", value=1000.0, step=5.0, format="%.2f")
-with colH:
-    FS = st.number_input("Factor de seguridad", value=2.50, step=0.1, format="%.2f")
-with colI:
-    precio_concreto = st.number_input("Concreto (S/ por m³)", value=650.0, step=10.0, format="%.2f")
+# Costos
+h2("Costos")
+colsC = st.columns(2)
+with colsC[0]:
+    concreto_Sm3 = st.number_input("Concreto (S/ por m³)", value=float(st.session_state.concreto), step=10.0, min_value=0.0, key="concreto")
+with colsC[1]:
+    acero_Skg = st.number_input("Acero (S/ por kg)", value=float(st.session_state.acero), step=0.1, min_value=0.0, key="acero")
 
 # Rangos
-st.subheader("Rangos de diseño (B, L, h)")
-c1, c2, c3 = st.columns(3)
-with c1:
-    Bmin, Bmax = st.slider("Base B (m)", min_value=0.6, max_value=5.0, value=(1.20, 3.20), step=0.05)
-    nB = st.number_input("Resolución B", value=30, step=1, min_value=5)
-with c2:
-    Lmin, Lmax = st.slider("Largo L (m)", min_value=0.6, max_value=6.0, value=(1.60, 4.20), step=0.05)
-    nL = st.number_input("Resolución L", value=30, step=1, min_value=5)
-with c3:
-    hmin, hmax = st.slider("Altura h (m)", min_value=0.20, max_value=2.00, value=(0.50, 1.10), step=0.02)
-    nh = st.number_input("Resolución h", value=10, step=1, min_value=3)
-
-# Personalizado (si aplica)
-personalizados = None
-if modelo == "Personalizado":
-    with st.expander("Factores personalizados (ASCII)"):
-        pc1, pc2, pc3 = st.columns(3)
-        with pc1:
-            Nc = st.number_input("Nc", value=5.14, step=0.1)
-            sc = st.number_input("sc", value=1.0, step=0.05)
-            dc = st.number_input("dc", value=1.0, step=0.05)
-        with pc2:
-            Nq = st.number_input("Nq", value=1.0, step=0.1)
-            sq = st.number_input("sq", value=1.0, step=0.05)
-            dq = st.number_input("dq", value=1.0, step=0.05)
-        with pc3:
-            Ng = st.number_input("Ng", value=0.0, step=0.1)
-            sg = st.number_input("sg", value=1.0, step=0.05)
-            dg = st.number_input("dg", value=1.0, step=0.05)
-        personalizados = dict(Nc=Nc, Nq=Nq, Ng=Ng, sc=sc, sq=sq, sg=sg, dc=dc, dq=dq, dg=dg)
+h2("Rangos de diseño (B, L, h)")
+colsR = st.columns(3)
+with colsR[0]:
+    st.write("Base B (m)")
+    Bmin, Bmax = st.slider(" ", min_value=0.8, max_value=5.0, value=(float(st.session_state.Bmin), float(st.session_state.Bmax)), step=0.1, label_visibility="collapsed")
+    Bn = st.number_input("Resolución B", value=int(st.session_state.Bn), step=1, min_value=5, max_value=60, key="Bn")
+with colsR[1]:
+    st.write("Largo L (m)")
+    Lmin, Lmax = st.slider("  ", min_value=0.8, max_value=6.0, value=(float(st.session_state.Lmin), float(st.session_state.Lmax)), step=0.1, label_visibility="collapsed")
+    Ln = st.number_input("Resolución L", value=int(st.session_state.Ln), step=1, min_value=5, max_value=60, key="Ln")
+with colsR[2]:
+    st.write("Altura h (m)")
+    hmin, hmax = st.slider("   ", min_value=0.30, max_value=2.0, value=(float(st.session_state.hmin), float(st.session_state.hmax)), step=0.05, label_visibility="collapsed")
+    hn = st.number_input("Resolución h", value=int(st.session_state.hn), step=1, min_value=3, max_value=40, key="hn")
 
 st.divider()
 
-# ------------------------- Botonera -------------------------
-bc1, bc2, bc3 = st.columns([1.0, 1.0, 1.0])
-with bc1:
-    run_grid = st.button("🔎 Analizar y optimizar", use_container_width=True)
-with bc2:
-    run_ga = st.button("🧬 Optimizar con GA (simple)", use_container_width=True)
-with bc3:
-    reset = st.button("↺ Restablecer", type="secondary", use_container_width=True)
+# Botonera (en una fila)
+bcols = st.columns([1, 1, 1])
+run_grid = bcols[0].button("🔎 Analizar y optimizar", use_container_width=True)
+run_ga   = bcols[1].button("🧬 Optimizar con GA (simple)", use_container_width=True)
+reset    = bcols[2].button("↺ Restablecer", use_container_width=True)
 
 if reset:
-    st.experimental_rerun()
+    for k in ["modelo","preset","gamma","c","phi","D","N","FS","concreto","acero",
+              "Bmin","Bmax","Bn","Lmin","Lmax","Ln","hmin","hmax","hn"]:
+        if k in st.session_state: del st.session_state[k]
+    st.rerun()
 
-# ------------------------- Ejecución: GRID -------------------------
-mejor = None
-df_all = pd.DataFrame()
+# ------------------------------
+# Lógica de cálculo / Resultados
+# ------------------------------
+def render_results(df_all: pd.DataFrame, df_valid: pd.DataFrame, title: str):
+    st.subheader(title)
 
-if run_grid:
-    with st.spinner("Buscando mejores combinaciones..."):
-        mejor, df_all = grid_search(modelo, gamma, c, phi, D, N, FS,
-                                    Bmin, Bmax, nB,
-                                    Lmin, Lmax, nL,
-                                    hmin, hmax, nh,
-                                    precio_concreto,
-                                    personalizados=personalizados)
-
-    if (df_all is None) or df_all.empty:
-        st.warning("No se encontraron soluciones que cumplan la **capacidad admisible**. "
-                   "Prueba con **B y L mayores**, **φ o c** más altos, **FS menor** o **carga menor**.")
-    else:
-        # Encabezado resumen
-        st.subheader("Resultados")
-        kpi1, kpi2, kpi3, kpi4 = st.columns(4)
-        with kpi1:
-            st.metric("B óptimo (m)", f"{mejor['B']:.2f}")
-        with kpi2:
-            st.metric("L óptimo (m)", f"{mejor['L']:.2f}")
-        with kpi3:
-            st.metric("h óptimo (m)", f"{mejor['h']:.2f}")
-        with kpi4:
-            st.metric("Costo (S/)", f"{mejor['costo']:.0f}")
-
-        # Gráfico q_req vs q_adm
-        fig_bar = go.Figure()
-        fig_bar.add_bar(name="q_req", x=["q_req"], y=[mejor["q_req"]])
-        fig_bar.add_bar(name="q_adm", x=["q_adm"], y=[mejor["q_adm"]])
-        fig_bar.update_layout(barmode="group", title="q_req vs q_adm (óptimo)", yaxis_title="kPa")
-        st.plotly_chart(fig_bar, use_container_width=True)
-
-        # Dispersión B vs L color costo
-        st.subheader("Candidatos válidos (color = Costo; tamaño = h)")
-        fig_sc = go.Figure(
-            data=go.Scatter(
-                x=df_all["B"], y=df_all["L"], mode="markers",
-                marker=dict(
-                    size=8 + 20 * (df_all["h"] - df_all["h"].min()) / (df_all["h"].max() - df_all["h"].min() + 1e-9),
-                    color=df_all["costo"], colorscale="Tealgrn", showscale=True, colorbar=dict(title="Costo (S/)")
-                ),
-                text=[f"h={h:.2f} m<br>Costo={c:.0f}" for h, c in zip(df_all["h"], df_all["costo"])]
-            )
+    if df_valid.empty:
+        warn(
+            "No se encontraron soluciones que cumplan la **capacidad admisible**. "
+            "Prueba con **B y L mayores**, **φ o c más altos**, **FS menor** o **carga menor**."
         )
-        fig_sc.update_layout(xaxis_title="B (m)", yaxis_title="L (m)")
-        st.plotly_chart(fig_sc, use_container_width=True)
+        if st.button("✨ Auto-ajustar y reintentar"):
+            # Ampliamos rangos y re-ejecutamos
+            st.session_state.Bmax = float(min(5.0, Bmax + 0.6))
+            st.session_state.Lmax = float(min(6.0, Lmax + 0.8))
+            st.session_state.hmax = float(min(2.0, hmax + 0.15))
+            st.session_state.Bn = int(min(60, Bn + 10))
+            st.session_state.Ln = int(min(60, Ln + 10))
+            st.session_state.hn = int(min(40, hn + 4))
+            st.rerun()
+        return
 
-        with st.expander("Tabla de candidatos"):
-            st.dataframe(df_all.sort_values("costo").reset_index(drop=True), use_container_width=True)
+    best = df_valid.iloc[0].to_dict()
 
-# ------------------------- Ejecución: GA (muy simple) -------------------------
-if run_ga:
-    # Pequeño GA aleatorio (solo para mostrar flujo; usa la misma verificación)
-    rng = np.random.default_rng(42)
-    pobl = 120
-    generaciones = 30
+    # Tarjetas del óptimo
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("B (m)", f"{best['B']:.2f}")
+    c2.metric("L (m)", f"{best['L']:.2f}")
+    c3.metric("h (m)", f"{best['h']:.2f}")
+    c4.metric("Costo (S/)", f"{best['costo']:.0f}")
 
-    def random_ind():
-        return dict(
-            B=float(rng.uniform(Bmin, Bmax)),
-            L=float(rng.uniform(Lmin, Lmax)),
-            h=float(rng.uniform(hmin, hmax))
+    # Gráfico barras q_req vs q_adm (óptimo)
+    fig_bar = go.Figure()
+    fig_bar.add_bar(name="q_req", x=["q_req"], y=[best["q_req"]], marker_color=PALETTE[0])
+    fig_bar.add_bar(name="q_adm", x=["q_adm"], y=[best["q_adm"]], marker_color=PALETTE[1])
+    fig_bar.update_layout(
+        barmode="group", yaxis_title="kPa",
+        title="q_req vs q_adm (óptimo)",
+        margin=dict(l=10, r=10, t=40, b=10),
+        legend=dict(orientation="h", x=0.5, xanchor="center")
+    )
+    st.plotly_chart(fig_bar, use_container_width=True)
+
+    # Dispersión B vs L (color = costo, tamaño = h)
+    fig_sc = px.scatter(
+        df_valid, x="B", y="L", color="costo", size="h",
+        color_continuous_scale="Tealgrn", title="Candidatos válidos (color=costo, tamaño=h)"
+    )
+    st.plotly_chart(fig_sc, use_container_width=True)
+
+    # Top-10
+    st.write("**Top 10 por costo**")
+    st.dataframe(df_valid.head(10), use_container_width=True)
+
+# Ejecutar búsquedas
+if run_grid or run_ga:
+    # Entradas reunidas
+    Br = (Bmin, Bmax, int(Bn))
+    Lr = (Lmin, Lmax, int(Ln))
+    hr = (hmin, hmax, int(hn))
+    Br2 = (Bmin, Bmax)
+    Lr2 = (Lmin, Lmax)
+    hr2 = (hmin, hmax)
+
+    if run_grid:
+        df_all, df_ok = grid_solve(
+            modelo, c, phi, gamma, D, N, FS, concreto_Sm3, acero_Skg,
+            Br, Lr, hr
         )
+        render_results(df_all, df_ok, "Resultado (búsqueda en grilla)")
 
-    def fitness(ind):
-        area = ind["B"] * ind["L"]
-        q_req = N / area
-        q_adm = q_admisible(modelo, c, phi, gamma, ind["B"], ind["L"], D, FS, personalizados=personalizados)
-        ok = q_adm >= q_req
-        costo = costo_concreto(ind["B"], ind["L"], ind["h"], precio_concreto)
-        # Penaliza si no cumple
-        return costo if ok else 1e12
+    if run_ga:
+        best, traj = ga_simple(
+            modelo, c, phi, gamma, D, N, FS, concreto_Sm3, acero_Skg,
+            Br2, Lr2, hr2, iters=1600
+        )
+        if best is None:
+            warn("El GA simple no encontró un candidato que cumpla. Prueba ampliar los rangos o disminuir FS.")
+        else:
+            dfx = pd.DataFrame([best])
+            st.subheader("Resultado GA (simple)")
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("B (m)", f"{best['B']:.2f}")
+            c2.metric("L (m)", f"{best['L']:.2f}")
+            c3.metric("h (m)", f"{best['h']:.2f}")
+            c4.metric("Costo (S/)", f"{best['costo']:.0f}")
 
-    poblacion = [random_ind() for _ in range(pobl)]
-    for _ in range(generaciones):
-        scores = np.array([fitness(ind) for ind in poblacion])
-        # selección (los mejores 40%)
-        idx = np.argsort(scores)[: int(0.4 * pobl)]
-        elite = [poblacion[i] for i in idx]
-        # reproducción + mutación
-        hijos = []
-        while len(elite) + len(hijos) < pobl:
-            a, b = rng.choice(elite, 2, replace=True)
-            child = dict(
-                B=max(Bmin, min(Bmax, (a["B"] + b["B"]) / 2 + rng.normal(0, 0.05))),
-                L=max(Lmin, min(Lmax, (a["L"] + b["L"]) / 2 + rng.normal(0, 0.05))),
-                h=max(hmin, min(hmax, (a["h"] + b["h"]) / 2 + rng.normal(0, 0.02))),
-            )
-            hijos.append(child)
-        poblacion = elite + hijos
+            fig_bar = go.Figure()
+            fig_bar.add_bar(name="q_req", x=["q_req"], y=[best["q_req"]], marker_color=PALETTE[0])
+            fig_bar.add_bar(name="q_adm", x=["q_adm"], y=[best["q_adm"]], marker_color=PALETTE[1])
+            fig_bar.update_layout(barmode="group", yaxis_title="kPa",
+                                  title="q_req vs q_adm (GA)",
+                                  margin=dict(l=10, r=10, t=40, b=10),
+                                  legend=dict(orientation="h", x=0.5, xanchor="center"))
+            st.plotly_chart(fig_bar, use_container_width=True)
 
-    # Mejor individuo
-    scores = np.array([fitness(ind) for ind in poblacion])
-    best = poblacion[int(np.argmin(scores))]
-    area = best["B"] * best["L"]
-    best_qreq = N / area
-    best_qadm = q_admisible(modelo, c, phi, gamma, best["B"], best["L"], D, FS, personalizados=personalizados)
-    best_cost = costo_concreto(best["B"], best["L"], best["h"], precio_concreto)
-
-    st.subheader("Resultado GA (simple)")
-    k1, k2, k3, k4 = st.columns(4)
-    k1.metric("B (m)", f"{best['B']:.2f}")
-    k2.metric("L (m)", f"{best['L']:.2f}")
-    k3.metric("h (m)", f"{best['h']:.2f}")
-    k4.metric("Costo (S/)", f"{best_cost:.0f}")
-
-    fig_bar2 = go.Figure()
-    fig_bar2.add_bar(name="q_req", x=["q_req"], y=[best_qreq])
-    fig_bar2.add_bar(name="q_adm", x=["q_adm"], y=[best_qadm])
-    fig_bar2.update_layout(barmode="group", title="q_req vs q_adm (GA)", yaxis_title="kPa")
-    st.plotly_chart(fig_bar2, use_container_width=True)
+            # trayectorias (puntos factibles)
+            traj_ok = traj[(traj["q_adm"] >= traj["q_req"])]
+            if not traj_ok.empty:
+                fig_sc = px.scatter(
+                    traj_ok, x="B", y="L", color="costo", size="h",
+                    color_continuous_scale="Tealgrn", title="Candidatos válidos muestreados por GA"
+                )
+                st.plotly_chart(fig_sc, use_container_width=True)
+            else:
+                tip("El GA no generó puntos factibles; considera ampliar rangos o reducir FS.")
 
