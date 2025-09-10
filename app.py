@@ -82,7 +82,7 @@ def desglose_costos(B,L,h,concreto_Sm3,acero_Skg):
 # ---------- Encabezado ----------
 st.title("Optimización de Cimentaciones")
 st.caption("Diseño óptimo por costo cumpliendo capacidad admisible — vista compacta")
-st.info("Ingresa **los datos** en la parte inferior y pulsa **Analizar y optimizar** u **Optimizar con GA**.")
+st.info("Ingresa **los datos**, pulsa **Analizar y optimizar** u **Optimizar con GA**.")
 
 # ---------- Entradas ----------
 st.markdown("## Parámetros de entrada")
@@ -256,7 +256,7 @@ def conclusiones(mejor, origen="Grilla"):
     st.write("• Revisa sensibilidad con **Meyerhof/Hansen/Vesic** para validar robustez del diseño.")
     st.write("• Verifica normativas locales y consideraciones constructivas (recubrimientos, asentamientos).")
 
-    st.markdown("#### Conclusión breve (para informe)")
+    st.markdown("#### Conclusión breve")
     texto = (
         f"Con el modelo **{st.session_state.modelo}**, la solución óptima ({origen}) "
         f"resultó en B={mejor['B']:.2f} m, L={mejor['L']:.2f} m, h={mejor['h']:.2f} m, "
@@ -271,7 +271,7 @@ def conclusiones(mejor, origen="Grilla"):
 # ---------- Resultados ----------
 if run_grid:
     validos, df_all = grid_search()
-    st.markdown("## Resultado (búsqueda en grilla)")
+    st.markdown("## Resultado")
     if validos.empty:
         st.warning("No se encontraron soluciones que cumplan la **capacidad admisible**. "
                    "Prueba con **B y L mayores**, **φ o c** más altos, **FS menor** o **carga menor**.")
@@ -280,7 +280,7 @@ if run_grid:
         pinta_resultado_mejor(mejor, "Mejor solución (grilla)")
         # Dispersión B-L
         fig2 = px.scatter(validos, x="B", y="L", color="costo", labels={"costo":"Costo (S/)"},
-                          title="Candidatos válidos (color=costo)", template="simple_white")
+                          title="Costo ", template="simple_white")
         fig2.update_layout(height=380, font_size=12, margin=dict(l=10,r=10,t=30,b=10))
         st.plotly_chart(fig2, use_container_width=True)
         st.markdown("#### Top 10 por costo")
@@ -305,4 +305,5 @@ with b1:
         set_demo_soft(); st.rerun()
 with b2:
     st.caption("Resultados compactos con conclusiones para tu informe.")
+
 
