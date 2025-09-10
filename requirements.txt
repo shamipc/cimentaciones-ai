@@ -4,7 +4,9 @@ pandas
 matplotlib
 plotly>=5.22
 reportlab
+xlsxwriter
 openpyxl
+
 
 
 
