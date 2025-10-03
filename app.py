@@ -1,4 +1,4 @@
-# app.py
+D# app.py
 import math
 import numpy as np
 import pandas as pd
@@ -152,6 +152,7 @@ if st.button("🔎 Analizar soluciones"):
         st.success(f"Mejor: B={mejor.B:.2f} m, L={mejor.L:.2f} m, h={mejor.h:.2f} m, Costo S/ {mejor.costo:.2f}")
         fig = px.scatter(df, x="B", y="L", color="costo", size="h", title="Soluciones válidas")
         st.plotly_chart(fig, use_container_width=True)
+
 
 
 
