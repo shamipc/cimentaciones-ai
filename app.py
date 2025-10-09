@@ -1,7 +1,6 @@
 # app.py
 # ------------------------------------------------------------
-# Optimización de Cimentaciones Superficiales – versión robusta
-# Adrian + ChatGPT
+# Optimización de Cimentaciones Superficiales – UI alineada a tu esquema
 # ------------------------------------------------------------
 import math
 import numpy as np
@@ -23,16 +22,16 @@ section.main .block-container {padding-top: 1rem; padding-bottom: 1rem;}
     unsafe_allow_html=True,
 )
 
-# ===================== Defaults =============================
+# ===================== Defaults (puedes cambiarlos en UI) ===
 DEFAULTS = dict(
     # --- Suelo (kN, m, kPa) ---
     gamma=18.0, c=25.0, phi=30.0, Es=15000.0, nu=0.30,
-    nivel_freatico=2.0, q_adm=150.0, q_ult=375.0,
+    nivel_freatico=2.0,
     # --- Cargas (kN, kN·m) ---
-    N=1000.0, Mx=0.0, My=0.0,
+    N=1000.0, Mx=10.0, My=10.0,
     # --- Materiales/costos ---
     fc=21.0, fy=420.0, recubrimiento=0.05,
-    concreto_Sm3=650.0, acero_Skg=5.50, excav_Sm3=80.0, relleno_Sm3=50.0,
+    concreto_Sm3=650.0, acero_Skg=5.50, excav_Sm3=80.0,
     # --- Reglas de diseño ---
     D=1.5, FS=2.5, asent_max=0.025,
     # --- Rango de búsqueda ---
@@ -40,24 +39,18 @@ DEFAULTS = dict(
     nB=30, nL=30, nh=12,
     # --- Modelo capacidad ---
     modelo="Meyerhof",
+    # --- Acero (kg/m3) para costo (ajustable rápido) ---
+    acero_kg_por_m3=60.0,
 )
 
 for k, v in DEFAULTS.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
-# ===================== Funciones base =======================
-def deg2rad(d: float) -> float:
-    return math.radians(d)
-
+# ===================== Funciones geotécnicas ================
 def bearing_capacity_factors(phi_deg: float):
-    """
-    Factores clásicos con phi en grados.
-    Nq = exp(pi*tan(phi)) * tan^2(45+phi/2)
-    Nc = (Nq-1)/tan(phi)  (si phi>0)  |  Nc=5.14 para phi≈0
-    Ngamma (Meyerhof) = 2*(Nq + 1)*tan(phi)
-    """
-    phi = deg2rad(phi_deg)
+    """Nc, Nq, Ngamma (Meyerhof) con phi en grados."""
+    phi = math.radians(phi_deg)
     if phi < 1e-6:
         Nq = 1.0
         Nc = 5.14
@@ -68,41 +61,29 @@ def bearing_capacity_factors(phi_deg: float):
         Ng = 2.0 * (Nq + 1.0) * math.tan(phi)
     return Nc, Nq, Ng
 
-def shape_factors(modelo: str, B: float, L: float, phi_deg: float):
-    # Ajustes por forma (simplificados).
+def shape_factors(modelo: str):
     if "Terzaghi" in modelo:
-        sc, sq, sg = 1.3, 1.2, 0.8
-    elif "Meyerhof" in modelo:
-        sc, sq, sg = 1.3, 1.2, 1.0
-    else:  # Hansen/Genérico
-        sc, sq, sg = 1.0, 1.0, 1.0
-    return sc, sq, sg
+        return 1.3, 1.2, 0.8
+    if "Meyerhof" in modelo:
+        return 1.3, 1.2, 1.0
+    return 1.0, 1.0, 1.0  # Hansen/Genérico
 
 def qult(modelo: str, gamma: float, c: float, phi_deg: float, B: float, D: float):
-    """
-    Capacidad última a cortante general (sin inclinación).
-    q = gamma*D
-    qult = c*Nc*sc + q*Nq*sq + 0.5*gamma*B*Ng*sg
-    """
+    """Capacidad última a cortante general: cNc + qNq + 0.5*γ*B*Ng."""
     Nc, Nq, Ng = bearing_capacity_factors(phi_deg)
-    sc, sq, sg = shape_factors(modelo, B, B, phi_deg)
+    sc, sq, sg = shape_factors(modelo)
     q = gamma * D
     return c * Nc * sc + q * Nq * sq + 0.5 * gamma * B * Ng * sg
 
 def qult_corr(modelo, gamma, c, phi, B, D, nivel_freatico):
-    """
-    Corrección hídrica (aprox.): si la base está por debajo del N.F.,
-    reducir el gamma efectivo.
-    """
+    """Corrección simple por nivel freático: γ efectivo si base por debajo del N.F."""
     gamma_eff = gamma if D >= nivel_freatico else 0.5 * gamma
     return qult(modelo, gamma_eff, c, phi, B, D)
 
 def q_required(N: float, Mx: float, My: float, B: float, L: float):
     """
     Presión requerida con excentricidades (área efectiva).
-    e_x = Mx/N, e_y = My/N
-    B' = B - 2|e_x| ; L' = L - 2|e_y|
-    q_req = N / (B' L'), si B',L' > 0; si no, inf (no cumple).
+    e_x = Mx/N, e_y = My/N.  B' = B - 2|e_x| ; L' = L - 2|e_y|
     """
     if N <= 0:
         return float("inf"), 0.0, 0.0, 0.0, 0.0
@@ -111,29 +92,28 @@ def q_required(N: float, Mx: float, My: float, B: float, L: float):
     L_eff = L - 2.0 * abs(e_y)
     if (B_eff <= 0.0) or (L_eff <= 0.0):
         return float("inf"), e_x, e_y, B_eff, L_eff
-    qreq = N / (B_eff * L_eff)
-    return qreq, e_x, e_y, B_eff, L_eff
+    return N / (B_eff * L_eff), e_x, e_y, B_eff, L_eff
 
-def total_cost(B, L, h, concreto_Sm3, acero_Skg, excav_Sm3, D):
+def costo_total(B, L, h, concreto_Sm3, acero_Skg, excav_Sm3, D, acero_kg_por_m3):
     vol = B * L * h
-    acero_kg = 60.0 * vol  # supuesto simple; puedes exponerlo como parámetro
+    acero_kg = acero_kg_por_m3 * vol
     excav = B * L * D
     return (vol * concreto_Sm3) + (acero_kg * acero_Skg) + (excav * excav_Sm3)
 
-def evaluar_candidato(B, L, h, ss):
+def evaluar(B, L, h, ss):
     q_req, ex, ey, B_eff, L_eff = q_required(ss.N, ss.Mx, ss.My, B, L)
     q_ult = qult_corr(ss.modelo, ss.gamma, ss.c, ss.phi, B, ss.D, ss.nivel_freatico)
     q_adm = q_ult / ss.FS
     margen = (q_adm - q_req) if np.isfinite(q_req) else -1e9
     cumple = (q_adm >= q_req) and np.isfinite(q_req)
-    costo = total_cost(B, L, h, ss.concreto_Sm3, ss.acero_Skg, ss.excav_Sm3, ss.D)
+    costo = costo_total(B, L, h, ss.concreto_Sm3, ss.acero_Skg, ss.excav_Sm3, ss.D, ss.acero_kg_por_m3)
     return {
         "B": B, "L": L, "h": h, "B_eff": B_eff, "L_eff": L_eff,
         "q_req": q_req, "q_adm": q_adm, "q_ult": q_ult, "margen": margen,
         "ex": ex, "ey": ey, "cumple": cumple, "costo": costo
     }
 
-# ===================== UI – Entradas =========================
+# ===================== UI – Entradas (igual a tu captura) ===
 st.title("Optimización de Cimentaciones Superficiales")
 
 st.markdown("### 🧪 Propiedades de suelo")
@@ -157,7 +137,7 @@ with cc2:
 with cc3:
     st.session_state.My = st.number_input("My (kN·m)", 0.0, 1e6, st.session_state.My, 5.0)
 
-st.markdown("### 📐 Parámetros de diseño y costos")
+st.markdown("### 🧮 Parámetros de diseño y costos")
 d1, d2, d3 = st.columns(3)
 with d1:
     st.session_state.D = st.number_input("Profundidad D (m)", 0.5, 6.0, st.session_state.D, 0.1)
@@ -193,7 +173,7 @@ with g2:
 with g3:
     st.session_state.nh = st.number_input("N° puntos en h", 3, 40, int(st.session_state.nh), 1)
 
-# ===================== BÚSQUEDA =============================
+# ===================== Cálculo / Búsqueda ===================
 if st.button("🚀 Analizar soluciones", use_container_width=True):
     Bs = np.linspace(st.session_state.B_min, st.session_state.B_max, int(st.session_state.nB))
     Ls = np.linspace(st.session_state.L_min, st.session_state.L_max, int(st.session_state.nL))
@@ -203,34 +183,32 @@ if st.button("🚀 Analizar soluciones", use_container_width=True):
     for B in Bs:
         for L in Ls:
             for h in hs:
-                rows.append(evaluar_candidato(B, L, h, st.session_state))
+                rows.append(evaluar(B, L, h, st.session_state))
     df = pd.DataFrame(rows)
     df_ok = df[df["cumple"]].copy()
 
     if df_ok.empty:
-        st.error("⚠️ No se encontraron soluciones que cumplan capacidad portante (revisa FS, N, φ, c o rangos B–L–h).")
+        st.error("⚠️ No se encontraron soluciones que cumplan capacidad portante. Ajusta FS, N, φ, c o los rangos B–L–h.")
         st.stop()
 
     # ===================== KPIs ============================
     mejor = df_ok.sort_values("costo", ascending=True).iloc[0]
-    # Opción robusta: 25º percentil de costo pero con mayor margen
-    p25 = df_ok["costo"].quantile(0.25)
+    p25 = df_ok["costo"].quantile(0.25)           # opción robusta: barato pero con alto margen
     df_rob = df_ok[df_ok["costo"] <= p25]
     robusta = df_rob.sort_values(["margen", "costo"], ascending=[False, True]).iloc[0]
 
-    cA, cB, cC, cD = st.columns(4)
-    cA.metric("Soluciones viables", f"{len(df_ok):,}")
-    cB.metric("Costo mínimo (S/)", f"{mejor['costo']:.0f}")
-    cC.metric("Margen mincost (kPa)", f"{mejor['margen']:.1f}")
-    cD.metric("Robusta: margen (kPa)", f"{robusta['margen']:.1f}")
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Soluciones viables", f"{len(df_ok):,}")
+    k2.metric("Costo mínimo (S/)", f"{mejor['costo']:.0f}")
+    k3.metric("Margen mincost (kPa)", f"{mejor['margen']:.1f}")
+    k4.metric("Robusta: margen (kPa)", f"{robusta['margen']:.1f}")
 
-    # ===================== Tablas ==========================
+    # ===================== Top 10 ==========================
     st.subheader("Top 10 soluciones por menor costo")
     st.dataframe(df_ok.sort_values("costo").head(10), use_container_width=True)
 
     # ===================== Gráficos ========================
     st.subheader("Visualizaciones")
-
     c1, c2 = st.columns(2)
     with c1:
         fig1 = px.scatter(
@@ -239,7 +217,6 @@ if st.button("🚀 Analizar soluciones", use_container_width=True):
             title="Soluciones viables (color=costo, tamaño=h)"
         )
         st.plotly_chart(fig1, use_container_width=True)
-
     with c2:
         fig2 = px.density_heatmap(
             df_ok, x="B", y="L", z="margen", nbinsx=30, nbinsy=30, histfunc="avg",
@@ -262,7 +239,7 @@ if st.button("🚀 Analizar soluciones", use_container_width=True):
 
     # ===================== Recomendación ===================
     st.markdown("## ✅ Recomendación automática")
-    texto_reco = (
+    texto = (
         "**Opción de mínimo costo**  \n"
         f"- B = **{mejor['B']:.2f} m**, L = **{mejor['L']:.2f} m**, h = **{mejor['h']:.2f} m**  \n"
         f"- q_req = **{mejor['q_req']:.1f} kPa**, q_adm = **{mejor['q_adm']:.1f} kPa**, "
@@ -273,12 +250,10 @@ if st.button("🚀 Analizar soluciones", use_container_width=True):
         f"- q_req = **{robusta['q_req']:.1f} kPa**, q_adm = **{robusta['q_adm']:.1f} kPa**, "
         f"margen = **{robusta['margen']:.1f} kPa**  \n"
         f"- Costo estimado = **S/ {robusta['costo']:.2f}**  \n\n"
-        f"**Criterio:** Se verifica capacidad portante con **área efectiva** "
-        f"(B′ = B − 2|eₓ|, L′ = L − 2|eᵧ|).  \n"
-        f"Se adopta **{st.session_state.modelo}** con FS = **{st.session_state.FS:.2f}** "
-        f"y D = **{st.session_state.D:.2f} m**."
+        f"**Criterio:** verificación por **área efectiva** (B′ = B − 2|eₓ|, L′ = L − 2|eᵧ|), "
+        f"modelo **{st.session_state.modelo}**, FS = **{st.session_state.FS:.2f}**, D = **{st.session_state.D:.2f} m**."
     )
-    st.markdown(texto_reco)
+    st.markdown(texto)
 
     # ===================== Exportación =====================
     st.subheader("📥 Exportar soluciones")
@@ -290,4 +265,3 @@ if st.button("🚀 Analizar soluciones", use_container_width=True):
         mime="text/csv",
         use_container_width=True,
     )
-
