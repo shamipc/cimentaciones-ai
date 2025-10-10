@@ -1,6 +1,7 @@
 # app.py
 # ------------------------------------------------------------
-# Optimización de Cimentaciones Superficiales – Suelo estratificado + Cargas por NORMA
+# Optimización de Cimentaciones Superficiales
+# Suelo estratificado + Cargas por NORMA + Clasificación (D/min(B,L))
 # ------------------------------------------------------------
 import math
 import numpy as np
@@ -32,7 +33,6 @@ SOIL_PROFILE = [
 ]
 
 # ===================== CARGAS VIVAS POR NORMA (kPa) =========
-# (resumen práctico de las tablas que compartiste)
 NORM_LL = {
     "Viviendas – áreas comunes/corredores": 2.0,
     "Viviendas – cuartos": 2.0,
@@ -60,6 +60,7 @@ NORM_LL = {
 
 # ===================== Utilidades suelos ====================
 GAMMA_W = 9.81  # kN/m3
+
 def gamma_efectivo(gamma, sumergido: bool) -> float:
     return gamma - GAMMA_W if sumergido else gamma
 
@@ -181,7 +182,7 @@ with c1:
 with c2:
     st.session_state.FS = st.number_input("FS capacidad", 1.5, 4.0, st.session_state.FS, 0.1)
 
-cD, phiD, gD, tipoD = (*params_en_base(st.session_state.D, st.session_state.nivel_freatico),)[0:4]
+cD, phiD, gD, tipoD = params_en_base(st.session_state.D, st.session_state.nivel_freatico)
 q_over = sobrecarga_efectiva(st.session_state.D, st.session_state.nivel_freatico)
 st.info(
     f"**En D = {st.session_state.D:.2f} m (estrato {tipoD})** → "
@@ -193,7 +194,8 @@ st.info(
 st.markdown("### 📦 Cargas por **Norma** (opcional; rellena N, Mx, My automáticamente)")
 coln1, coln2, coln3 = st.columns(3)
 with coln1:
-    uso = st.selectbox("Ocupación/uso", list(NORM_LL.keys()), index=list(NORM_LL.keys()).index("Viviendas – áreas comunes/corredores"))
+    uso = st.selectbox("Ocupación/uso", list(NORM_LL.keys()),
+                       index=list(NORM_LL.keys()).index("Viviendas – áreas comunes/corredores"))
     q_LL = NORM_LL[uso]
 with coln2:
     q_DL = st.number_input("Carga muerta DL (kPa)", 0.5, 15.0, 5.0, 0.1)
@@ -202,7 +204,6 @@ with coln3:
     area = st.number_input("Área tributaria (m²)", 0.5, 1000.0, 20.0, 0.5)
     carga_extra = st.number_input("Cargas adicionales (kN)", 0.0, 1e6, 0.0, 1.0)
 
-# Excentricidades → momentos
 colm1, colm2, colm3 = st.columns(3)
 with colm1:
     usar_norma = st.button("⬅️ Usar estas cargas")
@@ -212,7 +213,6 @@ with colm3:
     ey_in = st.number_input("Excentricidad eᵧ (m) (opcional)", 0.0, 2.0, 0.0, 0.01)
 
 if usar_norma:
-    # Cargas de servicio (sin mayorar) → N = (DL + LL) * A * niveles + extras
     N_calc = (q_DL + q_LL) * area * niveles + carga_extra
     st.session_state.N = float(N_calc)
     st.session_state.Mx = float(N_calc * ex_in)
@@ -245,8 +245,10 @@ with d3:
 
 m1, m2, m3 = st.columns(3)
 with m1:
-    st.session_state.modelo = st.selectbox("Modelo de capacidad", ["Meyerhof", "Terzaghi", "Hansen"],
-                                           index=["Meyerhof", "Terzaghi", "Hansen"].index(st.session_state.modelo))
+    st.session_state.modelo = st.selectbox(
+        "Modelo de capacidad", ["Meyerhof", "Terzaghi", "Hansen"],
+        index=["Meyerhof", "Terzaghi", "Hansen"].index(st.session_state.modelo)
+    )
 with m2:
     st.session_state.acero_kg_por_m3 = st.number_input("Acero asumido (kg/m³)", 10.0, 150.0, float(st.session_state.acero_kg_por_m3), 5.0)
 with m3:
@@ -255,11 +257,17 @@ with m3:
 st.markdown("### 🔎 Rangos de B, L, h")
 r1, r2, r3 = st.columns(3)
 with r1:
-    st.session_state.B_min, st.session_state.B_max = st.slider("Base B (m)", 0.5, 8.0, (float(st.session_state.B_min), float(st.session_state.B_max)))
+    st.session_state.B_min, st.session_state.B_max = st.slider(
+        "Base B (m)", 0.5, 8.0, (float(st.session_state.B_min), float(st.session_state.B_max))
+    )
 with r2:
-    st.session_state.L_min, st.session_state.L_max = st.slider("Largo L (m)", 0.5, 8.0, (float(st.session_state.L_min), float(st.session_state.L_max)))
+    st.session_state.L_min, st.session_state.L_max = st.slider(
+        "Largo L (m)", 0.5, 8.0, (float(st.session_state.L_min), float(st.session_state.L_max))
+    )
 with r3:
-    st.session_state.h_min, st.session_state.h_max = st.slider("Espesor h (m)", 0.3, 2.5, (float(st.session_state.h_min), float(st.session_state.h_max)))
+    st.session_state.h_min, st.session_state.h_max = st.slider(
+        "Espesor h (m)", 0.3, 2.5, (float(st.session_state.h_min), float(st.session_state.h_max))
+    )
 
 g1, g2, g3 = st.columns(3)
 with g1:
@@ -315,6 +323,21 @@ if st.button("🚀 Analizar soluciones", use_container_width=True):
     k2.metric("Costo mínimo (S/)", f"{mejor['Costo estimado (S/)']:.0f}")
     k3.metric("Margen (mín. costo)", f"{mejor['Margen de seguridad (kPa)']:.1f} kPa")
     k4.metric("Margen (opción robusta)", f"{robusta['Margen de seguridad (kPa)']:.1f} kPa")
+
+    # ===================== Clasificación superficial/profunda ===
+    B_char = min(float(mejor['Base B (m)']), float(mejor['Largo L (m)']))  # dimensión característica
+    eta = float(st.session_state.D) / B_char  # D / min(B,L)
+
+    if eta <= 1.0:
+        clase_cimentacion = "CIMENTACIÓN SUPERFICIAL (zapata)"
+    elif eta <= 3.0:
+        clase_cimentacion = "CIMENTACIÓN SUPERFICIAL (semiprofunda)"
+    elif eta <= 4.0:
+        clase_cimentacion = "ZONA DE TRANSICIÓN (revisar opción profunda)"
+    else:
+        clase_cimentacion = "CIMENTACIÓN PROFUNDA (pilotes/pozos)"
+
+    st.metric("Clasificación (D / min(B,L))", f"{clase_cimentacion}", f"{eta:.2f}")
 
     # ===================== Top 10 ==========================
     st.subheader("Top 10 soluciones por menor costo")
@@ -382,7 +405,8 @@ if st.button("🚀 Analizar soluciones", use_container_width=True):
         st.markdown(
             "- **Presión requerida**: N /(B′·L′), usando excentricidades (área efectiva).\n"
             "- **Capacidad admisible**: qult/FS con c, φ y γ del estrato de apoyo y σ′v(D) acumulada.\n"
-            "- **Margen de seguridad**: Capacidad admisible − Presión requerida."
+            "- **Margen de seguridad**: Capacidad admisible − Presión requerida.\n"
+            "- **Clasificación**: D/min(B,L) ≤ 1 superficial; 1–3 semiprofunda; 3–4 transición; >4 profunda."
         )
 
     # ===================== Recomendación ===================
@@ -405,6 +429,9 @@ if st.button("🚀 Analizar soluciones", use_container_width=True):
         f"Capacidad admisible = **{robusta['Capacidad admisible del suelo (kPa)']:.1f} kPa**  \n"
         f"- Margen de seguridad = **{robusta['Margen de seguridad (kPa)']:.1f} kPa**  \n"
         f"- Costo estimado = **S/ {robusta['Costo estimado (S/)']:.2f}**  \n\n"
+        f"**Clasificación geométrica** (con la solución de mínimo costo): "
+        f"D/min(B,L) = **{eta:.2f}** → **{clase_cimentacion}**.  \n"
+        f"*(Además del criterio geométrico, confirma con capacidad, asentamientos y el perfil estratificado.)*\n\n"
         f"**Criterio de cargas**: si se usó la sección de **Norma**, N = (DL + LL_norma) × Área × Niveles + extras; "
         f"momentos por excentricidades ingresadas (M = N·e)."
     )
