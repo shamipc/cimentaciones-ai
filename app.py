@@ -1,6 +1,6 @@
 # app.py — versión mínima centrada en funciones objetivo
 # Cumple: q_serv ≤ q_adm, q_max ≤ q_adm y s ≤ s_adm
-# FO1 = Min. costo | FO2 = Min. (Costo/Margen) | Recomendación automática
+# FO1 = Min. costo | FO2 = Min. Utilización (q_serv/q_adm) | Recomendación automática
 
 import math
 import numpy as np
@@ -18,7 +18,7 @@ except Exception:
 
 st.set_page_config(page_title="Optimización de Cimentaciones — Minimal", layout="centered")
 st.title("Optimización de Cimentaciones (mínima)")
-st.caption("Entradas mínimas (paper) + 2 funciones objetivo (FO1 costo, FO2 costo/margen) con verificación de servicio.")
+st.caption("Entradas mínimas (paper) + 2 funciones objetivo (FO1 costo, FO2 utilización) con verificación de servicio.")
 
 # ======================== Entradas mínimas ========================
 c1, c2 = st.columns(2)
@@ -89,7 +89,8 @@ if SKLEARN_OK:
             except Exception as e:
                 st.error(f"Error entrenando: {e}")
 
-# ======================== Capacidad última ========================
+# ======================== Capacidad última (q_u) ====================
+# Si no hay ML, CALCULAMOS q_u con Meyerhof (validado en literatura).
 def bearing_factors(phi_deg: float):
     phi_rad = math.radians(phi_deg)
     if phi_rad < 1e-6:
@@ -104,7 +105,7 @@ def qult_meyerhof(B, D, phi, gamma):
     Nc, Nq, Ng = bearing_factors(phi)
     sc, sq, sg = 1.3, 1.2, 1.0  # rectangular
     q_eff = gamma * D
-    # c≈0 (friccionantes). Si necesitas c>0, puedes añadirlo.
+    # c≈0 (suelo friccional). Si necesitas cohesión, añade: + c*Nc*sc
     return q_eff * Nq * sq + 0.5 * gamma * B * Ng * sg
 
 def qult_pred(gamma, B, D, phi, L_over_B):
@@ -115,7 +116,7 @@ def qult_pred(gamma, B, D, phi, L_over_B):
 
 # ======================== Servicio y asentamiento =============
 def contact_pressures(N, B, L, ex=0.0, ey=0.0):
-    """q_serv y q_max considerando núcleo/área efectiva (sin momentos por defecto)."""
+    """q_serv y q_max con núcleo/área efectiva (aquí sin momentos)."""
     qavg = N / (B * L)
     in_kern = (abs(ex) <= B / 6) and (abs(ey) <= L / 6)
     if in_kern:
@@ -160,31 +161,35 @@ if st.button("🚀 Optimizar (FO1 & FO2)"):
                 continue
             costo = cost_S(B, L, h, D=D)
             margen = qadm - qserv
-            rows.append([B, L, h, qu, qadm, qserv, qmax, s, costo, margen])
+            U = qserv / qadm  # ← Utilización (Demanda/Capacidad)
+            rows.append([B, L, h, qu, qadm, qserv, qmax, s, costo, margen, U])
 
     if not rows:
         st.error("Sin soluciones factibles con los parámetros dados.")
         st.stop()
 
-    df = pd.DataFrame(rows, columns=["B", "L", "h", "qu", "qadm", "qserv", "qmax", "s_mm", "costo", "margen"])
+    df = pd.DataFrame(rows, columns=[
+        "B", "L", "h", "qu", "qadm", "qserv", "qmax", "s_mm", "costo", "margen", "U"
+    ])
 
-    # FO1: costo mínimo
+    # -------- FO1: mínimo costo --------
     fo1 = df.loc[df["costo"].idxmin()]
-    # FO2: mínimo Costo/Margen (eficiencia)
-    df["cost_over_margin"] = df["costo"] / df["margen"].replace(0, np.nan)
-    fo2 = df.loc[df["cost_over_margin"].idxmin()]
 
-    # ===== Decisión automática y transparente =====
+    # -------- FO2: Utilización mínima (criterio clásico) --------
+    fo2 = df.sort_values(["U", "costo"]).iloc[0]
+
+    # ===== Regla de decisión acordada =====
+    # Elige FO2 si: mejora relativa de U ≥ 12 %, mejora de s ≥ 5 mm y ΔCosto ≤ 6 %
     def decidir(fo1, fo2):
         c1, c2 = fo1.costo, fo2.costo
         s1, s2 = fo1.s_mm, fo2.s_mm
-        m1, m2 = fo1.margen, fo2.margen
-        # Si FO2 mejora claramente el desempeño y su costo es ≲ +5%, elegimos FO2.
-        if (s1 - s2 >= 5.0) and (m2 - m1 >= 50.0) and (c2 <= 1.05 * c1):
-            why = f"Se elige **FO2** por mejor desempeño (−{s1 - s2:.1f} mm en s, +{m2 - m1:.1f} kPa en margen) con costo ≲ +5%."
-            return fo2, "FO2 (Costo/Margen)", why
-        # En otro caso, priorizamos costo mínimo.
-        return fo1, "FO1 (Costo mínimo)", "Se elige **FO1**: el ahorro de costo domina; mejoras de FO2 no justifican sobrecosto."
+        U1, U2 = fo1.U, fo2.U
+        mejora_rel_U = (U1 - U2) / U1 if U1 > 0 else 0.0
+        if (mejora_rel_U >= 0.12) and (s1 - s2 >= 5.0) and (c2 <= 1.06 * c1):
+            why = (f"Se elige **FO2 (Utilización)**: reduce U en {100*mejora_rel_U:.1f}% "
+                   f"y s en {s1 - s2:.1f} mm, con ΔCosto {100*(c2/c1-1):.1f}% ≤ 6%.")
+            return fo2, "FO2 (Utilización mínima)", why
+        return fo1, "FO1 (Costo mínimo)", "Se elige **FO1**: el ahorro de costo domina; mejoras de U/s no justifican el sobrecosto."
 
     chosen, tag, why = decidir(fo1, fo2)
 
@@ -198,10 +203,10 @@ if st.button("🚀 Optimizar (FO1 & FO2)"):
     cA, cB = st.columns(2)
     with cA:
         st.subheader("FO1 · Mínimo costo")
-        st.write(fo1[["B", "L", "h", "qserv", "qadm", "qmax", "s_mm", "costo", "margen"]])
+        st.write(fo1[["B", "L", "h", "qserv", "qadm", "U", "qmax", "s_mm", "costo", "margen"]])
     with cB:
-        st.subheader("FO2 · Mínimo Costo/Margen")
-        st.write(fo2[["B", "L", "h", "qserv", "qadm", "qmax", "s_mm", "costo", "margen", "cost_over_margin"]])
+        st.subheader("FO2 · Utilización mínima")
+        st.write(fo2[["B", "L", "h", "qserv", "qadm", "U", "qmax", "s_mm", "costo", "margen"]])
 
     st.markdown("### ✅ Recomendación")
     st.write(
@@ -210,7 +215,7 @@ if st.button("🚀 Optimizar (FO1 & FO2)"):
         f"q_serv = **{chosen.qserv:.1f} kPa** ≤ q_adm = **{chosen.qadm:.1f} kPa**; "
         f"q_max = **{chosen.qmax:.1f} kPa** ≤ q_adm  \n"
         f"s = **{chosen.s_mm:.1f} mm** ≤ s_adm = **{s_adm_mm:.0f} mm**  \n"
-        f"Costo ≈ **S/ {chosen.costo:,.2f}**; Margen = **{chosen.margen:.1f} kPa**  \n"
+        f"U = **{chosen.U:.3f}**; Costo ≈ **S/ {chosen.costo:,.2f}**; Margen = **{chosen.margen:.1f} kPa**  \n"
         f"**Motivo:** {why}"
     )
 
