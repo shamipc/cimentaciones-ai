@@ -1,6 +1,6 @@
-# app.py — versión mínima centrada en funciones objetivo
-# Cumple: q_serv ≤ q_adm, q_max ≤ q_adm y s ≤ s_adm
-# FO1 = Min. costo | FO2 = Min. Utilización (q_serv/q_adm) | Recomendación automática
+# app.py — versión mínima con 2 funciones objetivo (lista para Streamlit)
+# Verificaciones: q_serv ≤ q_adm, q_max ≤ q_adm, s ≤ s_adm
+# FO1 = Min. costo | FO2 = Min. utilización (q_serv/q_adm) | Recomendación automática
 
 import math
 import numpy as np
@@ -18,7 +18,10 @@ except Exception:
 
 st.set_page_config(page_title="Optimización de Cimentaciones — Minimal", layout="centered")
 st.title("Optimización de Cimentaciones (mínima)")
-st.caption("Entradas mínimas (paper) + 2 funciones objetivo (FO1 costo, FO2 utilización) con verificación de servicio.")
+st.caption(
+    "Entradas mínimas (paper) + 2 funciones objetivo: **FO1 costo** y **FO2 utilización (q_serv/q_adm)** "
+    "con verificación de servicio."
+)
 
 # ======================== Entradas mínimas ========================
 c1, c2 = st.columns(2)
@@ -50,8 +53,10 @@ st.markdown("---")
 # ======================== ML opcional (paper) ========================
 st.subheader("ML opcional (paper)")
 if not SKLEARN_OK:
-    st.warning("Para usar ML, agrega `scikit-learn>=1.3,<1.5` en requirements.txt. "
-               "Si no, se usará el método clásico (Meyerhof).")
+    st.warning(
+        "Para usar ML, agrega `scikit-learn>=1.3,<1.5` en requirements.txt. "
+        "Si no, se usará el método clásico (Meyerhof)."
+    )
 use_ml = False
 ML_MODEL = None
 RMSE = None
@@ -66,7 +71,7 @@ if SKLEARN_OK:
         miss = [c for c in req if c not in df.columns]
         if miss:
             raise ValueError(f"Faltan columnas: {miss}")
-        X = df[["gamma", "B", "D", "phi", "L_over_B"]]
+        X = df[["gamma", "B", "D", "phi", "L_over_B"]].astype(float)
         y = df["qu"].astype(float)
         Xtr, Xva, ytr, yva = train_test_split(X, y, test_size=0.15, random_state=42)
         gbr = GradientBoostingRegressor(random_state=42)
@@ -90,7 +95,7 @@ if SKLEARN_OK:
                 st.error(f"Error entrenando: {e}")
 
 # ======================== Capacidad última (q_u) ====================
-# Si no hay ML, CALCULAMOS q_u con Meyerhof (validado en literatura).
+# Meyerhof (clásico) — se usa por defecto si no hay ML
 def bearing_factors(phi_deg: float):
     phi_rad = math.radians(phi_deg)
     if phi_rad < 1e-6:
@@ -105,14 +110,26 @@ def qult_meyerhof(B, D, phi, gamma):
     Nc, Nq, Ng = bearing_factors(phi)
     sc, sq, sg = 1.3, 1.2, 1.0  # rectangular
     q_eff = gamma * D
-    # c≈0 (suelo friccional). Si necesitas cohesión, añade: + c*Nc*sc
+    # c≈0 (friccional). Si necesitas cohesión: + c*Nc*sc
     return q_eff * Nq * sq + 0.5 * gamma * B * Ng * sg
 
 def qult_pred(gamma, B, D, phi, L_over_B):
+    """Devuelve q_u: ML si está activo; si no, Meyerhof."""
     if use_ml and (ML_MODEL is not None) and SKLEARN_OK:
-        X = pd.DataFrame([{"gamma": gamma, "B": B, "D": D, "phi": phi, "L_over_B": L_over_B}])
+        X = pd.DataFrame(
+            [{"gamma": float(gamma), "B": float(B), "D": float(D), "phi": float(phi), "L_over_B": float(L_over_B)}]
+        )
         return float(ML_MODEL.predict(X)[0])
     return qult_meyerhof(B, D, phi, gamma)
+
+def qult_ml_only(gamma, B, D, phi, L_over_B):
+    """Sólo ML (para comparar); devuelve None si no hay ML entrenado/activo."""
+    if use_ml and (ML_MODEL is not None) and SKLEARN_OK:
+        X = pd.DataFrame(
+            [{"gamma": float(gamma), "B": float(B), "D": float(D), "phi": float(phi), "L_over_B": float(L_over_B)}]
+        )
+        return float(ML_MODEL.predict(X)[0])
+    return None
 
 # ======================== Servicio y asentamiento =============
 def contact_pressures(N, B, L, ex=0.0, ey=0.0):
@@ -161,16 +178,17 @@ if st.button("🚀 Optimizar (FO1 & FO2)"):
                 continue
             costo = cost_S(B, L, h, D=D)
             margen = qadm - qserv
-            U = qserv / qadm  # ← Utilización (Demanda/Capacidad)
+            U = qserv / qadm  # Utilización (Demanda/Capacidad)
             rows.append([B, L, h, qu, qadm, qserv, qmax, s, costo, margen, U])
 
     if not rows:
         st.error("Sin soluciones factibles con los parámetros dados.")
         st.stop()
 
-    df = pd.DataFrame(rows, columns=[
-        "B", "L", "h", "qu", "qadm", "qserv", "qmax", "s_mm", "costo", "margen", "U"
-    ])
+    df = pd.DataFrame(
+        rows,
+        columns=["B", "L", "h", "qu", "qadm", "qserv", "qmax", "s_mm", "costo", "margen", "U"],
+    )
 
     # -------- FO1: mínimo costo --------
     fo1 = df.loc[df["costo"].idxmin()]
@@ -179,25 +197,32 @@ if st.button("🚀 Optimizar (FO1 & FO2)"):
     fo2 = df.sort_values(["U", "costo"]).iloc[0]
 
     # ===== Regla de decisión acordada =====
-    # Elige FO2 si: mejora relativa de U ≥ 12 %, mejora de s ≥ 5 mm y ΔCosto ≤ 6 %
+    # Elegir FO2 si: mejora relativa de U ≥ 12 %, mejora de s ≥ 5 mm y ΔCosto ≤ 6 %
     def decidir(fo1, fo2):
-        c1, c2 = fo1.costo, fo2.costo
-        s1, s2 = fo1.s_mm, fo2.s_mm
-        U1, U2 = fo1.U, fo2.U
+        c1, c2 = float(fo1.costo), float(fo2.costo)
+        s1, s2 = float(fo1.s_mm), float(fo2.s_mm)
+        U1, U2 = float(fo1.U), float(fo2.U)
         mejora_rel_U = (U1 - U2) / U1 if U1 > 0 else 0.0
         if (mejora_rel_U >= 0.12) and (s1 - s2 >= 5.0) and (c2 <= 1.06 * c1):
-            why = (f"Se elige **FO2 (Utilización)**: reduce U en {100*mejora_rel_U:.1f}% "
-                   f"y s en {s1 - s2:.1f} mm, con ΔCosto {100*(c2/c1-1):.1f}% ≤ 6%.")
+            why = (
+                f"Se elige **FO2 (Utilización)**: reduce U en {100*mejora_rel_U:.1f}% "
+                f"y s en {s1 - s2:.1f} mm, con ΔCosto {100*(c2/c1-1):.1f}% ≤ 6%."
+            )
             return fo2, "FO2 (Utilización mínima)", why
-        return fo1, "FO1 (Costo mínimo)", "Se elige **FO1**: el ahorro de costo domina; mejoras de U/s no justifican el sobrecosto."
+        return fo1, "FO1 (Costo mínimo)", (
+            "Se elige **FO1**: el ahorro de costo domina; las mejoras de U/s de FO2 no justifican el sobrecosto."
+        )
 
     chosen, tag, why = decidir(fo1, fo2)
 
     # Mensaje del modelo usado
     st.success(
         "Modelo de capacidad usado: "
-        + ("**ML** (paper)" + (f" — RMSE≈ {RMSE:,.2f} kPa" if RMSE else "")
-           if (use_ml and (ML_MODEL is not None) and SKLEARN_OK) else "**Meyerhof** (clásico)")
+        + (
+            "**ML** (paper)" + (f" — RMSE≈ {RMSE:,.2f} kPa" if RMSE else "")
+            if (use_ml and (ML_MODEL is not None) and SKLEARN_OK)
+            else "**Meyerhof** (clásico)"
+        )
     )
 
     cA, cB = st.columns(2)
@@ -211,13 +236,25 @@ if st.button("🚀 Optimizar (FO1 & FO2)"):
     st.markdown("### ✅ Recomendación")
     st.write(
         f"**{tag}**  \n"
-        f"B = **{chosen.B:.2f} m**, L = **{chosen.L:.2f} m**, h = **{chosen.h:.2f} m**  \n"
-        f"q_serv = **{chosen.qserv:.1f} kPa** ≤ q_adm = **{chosen.qadm:.1f} kPa**; "
-        f"q_max = **{chosen.qmax:.1f} kPa** ≤ q_adm  \n"
-        f"s = **{chosen.s_mm:.1f} mm** ≤ s_adm = **{s_adm_mm:.0f} mm**  \n"
-        f"U = **{chosen.U:.3f}**; Costo ≈ **S/ {chosen.costo:,.2f}**; Margen = **{chosen.margen:.1f} kPa**  \n"
+        f"B = **{float(chosen.B):.2f} m**, L = **{float(chosen.L):.2f} m**, h = **{float(chosen.h):.2f} m**  \n"
+        f"q_serv = **{float(chosen.qserv):.1f} kPa** ≤ q_adm = **{float(chosen.qadm):.1f} kPa**; "
+        f"q_max = **{float(chosen.qmax):.1f} kPa** ≤ q_adm  \n"
+        f"s = **{float(chosen.s_mm):.1f} mm** ≤ s_adm = **{s_adm_mm:.0f} mm**  \n"
+        f"U = **{float(chosen.U):.3f}**; Costo ≈ **S/ {float(chosen.costo):,.2f}**; "
+        f"Margen = **{float(chosen.margen):.1f} kPa**  \n"
         f"**Motivo:** {why}"
     )
+
+    # --- Comparación q_u (sólo si hay ML entrenado) ---
+    qu_ml = qult_ml_only(gamma, float(chosen.B), D, phi, L_over_B)
+    if qu_ml is not None:
+        qu_classic = qult_meyerhof(float(chosen.B), D, phi, gamma)
+        diff = 100.0 * (qu_ml - qu_classic) / qu_classic if qu_classic else np.nan
+        st.info(
+            f"**Comparación q_u** — ML: {qu_ml:.1f} kPa vs. Meyerhof: {qu_classic:.1f} kPa "
+            f"(**Δ = {diff:+.1f}%**). "
+            + ("Consistencia adecuada (±20%)." if abs(diff) <= 20 else "Revisar datos/escala: diferencia > ±20%.")
+        )
 
     st.download_button(
         "Descargar soluciones (CSV)",
