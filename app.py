@@ -1,19 +1,23 @@
 # app.py
 # ------------------------------------------------------------
-# Optimización de Cimentaciones Superficiales
-# - Perfil estratificado (Proyecto 01) + nivel freático
-# - Cargas por Norma (DL/LL) + carga adicional y excentricidades
+# Optimización de Cimentaciones Superficiales (Streamlit)
+# - Perfil estratificado + nivel freático
+# - Cargas por Norma (DL/LL) + excentricidades
 # - Modelos de capacidad: Terzaghi / Meyerhof / Hansen
-# - VERIFICACIÓN q_max <= q_adm  (criterio por presión máxima)
-# - Costeo unitario (S/) con opción de ajuste según suelo (Leyton 2025)
-# - Benchmark de costos (Calderón 2015)
-# - Estadística + visualizaciones + recomendación
+# - ML opcional “estilo paper” (GBRT + GridSearchCV) para qu_ult
+# - Criterios: q_req ≤ q_adm, q_max ≤ q_adm, s ≤ s_adm
+# - FO1: Mínimo costo   |   FO2: Mínimo (Costo/Margen)
+# - Recomendación automática (IA) + KPIs + gráficas + export
 # ------------------------------------------------------------
 import math
 import numpy as np
 import pandas as pd
 import streamlit as st
 import plotly.express as px
+
+# ===== ML (paper-like) =====
+from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.ensemble import GradientBoostingRegressor
 
 # ===================== Config & Estilo ======================
 st.set_page_config(page_title="Optimización de Cimentaciones", layout="wide")
@@ -72,12 +76,7 @@ CALDERON_USD_M2 = {
 }
 
 # ===================== Multiplicadores por suelo =============
-# (Leyton 2025: costos relativos)
-SOIL_COST_MULT = {
-    "Friccional": 1.00,
-    "Cohesivo": 1.20,
-    "Mixto (c-φ)": 1.094,
-}
+SOIL_COST_MULT = {"Friccional": 1.00, "Cohesivo": 1.20, "Mixto (c-φ)": 1.094}
 
 # ===================== Utilidades de suelo ===================
 GAMMA_W = 9.81  # kN/m³
@@ -120,15 +119,11 @@ def soil_category(c, phi):
 
 # ===================== Defaults UI ==========================
 DEFAULTS = dict(
-    # cargas
     N=1000.0, Mx=10.0, My=10.0,
-    # geotecnia
     D=1.50, FS=2.5, nivel_freatico=100.0, modelo="Meyerhof",
-    # costos
     concreto_Sm3=650.0, acero_Skg=5.50, excav_Sm3=80.0,
     acero_kg_por_m3=60.0, tcambio=3.80,
     modo_costo="Unitario detallado (S/)", tipo_benchmark="Zapata aislada",
-    # búsqueda geométrica
     B_min=1.0, B_max=4.0, L_min=1.0, L_max=4.0, h_min=0.5, h_max=1.5,
     nB=30, nL=30, nh=12,
 )
@@ -136,14 +131,30 @@ for k, v in DEFAULTS.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
-# ===================== Capacidad portante ====================
+# ===================== ML (estado & helpers) =================
+ML_STATE = {"enabled": False, "model": None, "rmse": None}
+ML_FEATURES = ["gamma", "B", "D", "phi", "L_over_B"]
+
+def train_ml_from_df(df: pd.DataFrame):
+    X = df[ML_FEATURES].copy()
+    y = df["qu"].astype(float).copy()
+    Xtr, Xva, ytr, yva = train_test_split(X, y, test_size=0.15, random_state=42)
+    gbr = GradientBoostingRegressor(random_state=42)
+    grid = GridSearchCV(
+        gbr,
+        {"n_estimators": [100, 200], "max_depth": [2, 3, 4], "learning_rate": [0.05, 0.1]},
+        cv=5,
+        scoring="neg_root_mean_squared_error",
+    )
+    grid.fit(Xtr, ytr)
+    return grid.best_estimator_, -grid.best_score_
+
+def predict_qu_ml(model, gamma, B, D, phi, L_over_B) -> float:
+    Xnew = pd.DataFrame([{"gamma": gamma, "B": B, "D": D, "phi": phi, "L_over_B": L_over_B}])
+    return float(model.predict(Xnew)[0])
+
+# ===================== Factores/Modelos de capacidad =========
 def bearing_capacity_factors(phi_deg: float):
-    """
-    Factores clásicos:
-      Nq = e^(π·tanφ) · tan^2(45°+φ/2)
-      Nc = (Nq - 1)/tanφ,  Nc(φ=0) = 5.14
-      Nγ = 2 (Nq + 1) tanφ
-    """
     phi = math.radians(phi_deg)
     if phi < 1e-6:
         Nq = 1.0; Nc = 5.14; Ng = 0.0
@@ -158,10 +169,20 @@ def shape_factors(modelo: str):
     if "Meyerhof" in modelo:  return 1.3, 1.2, 1.0
     return 1.0, 1.0, 1.0  # Hansen (básico)
 
-def qult_estratificado(modelo, D, B, nivel_freatico):
-    """Capacidad última considerando c, φ, γef del estrato en base y σ'v(D)."""
+def qult_estratificado(modelo, D, B, nivel_freatico, L=None):
+    """
+    Capacidad última en base:
+    - Si ML está activo: usa modelo entrenado (paper).
+    - Si no: usa método clásico seleccionado.
+    """
     c, phi, gamma_base_eff, _ = params_en_base(D, nivel_freatico)
     q_eff = sobrecarga_efectiva(D, nivel_freatico)
+
+    if ML_STATE["enabled"] and (L is not None) and (ML_STATE["model"] is not None):
+        L_over_B = L / B if B > 0 else 1.0
+        qult_ml = predict_qu_ml(ML_STATE["model"], gamma_base_eff, B, D, phi, L_over_B)
+        return qult_ml, q_eff, c, phi, gamma_base_eff
+
     Nc, Nq, Ng = bearing_capacity_factors(phi)
     sc, sq, sg = shape_factors(modelo)
     qult = c*Nc*sc + q_eff*Nq*sq + 0.5*gamma_base_eff*B*Ng*sg
@@ -169,39 +190,18 @@ def qult_estratificado(modelo, D, B, nivel_freatico):
 
 # ===================== Presiones de contacto =================
 def contact_pressures(N: float, Mx: float, My: float, B: float, L: float):
-    """
-    Devuelve:
-      q_req -> presión media requerida usando área efectiva (B'·L')
-      q_max -> presión máxima de contacto (criterio)
-      ex, ey -> excentricidades
-      B_eff, L_eff -> dimensiones efectivas
-      in_kern -> True si la resultante cae dentro del núcleo (|e|<=B/6, L/6)
-    Reglas:
-      - Dentro del núcleo: qmax = qavg*(1+6|ex|/B+6|ey|/L)
-      - Fuera del núcleo: método de área efectiva, qmax ≈ 2*N/(B'·L')
-    """
     if N <= 0:
         return float("inf"), float("inf"), 0.0, 0.0, 0.0, 0.0, False
-
-    ex = Mx / N
-    ey = My / N
-
-    A = B * L
-    q_avg = N / A
-
-    B_eff = B - 2.0 * abs(ex)
-    L_eff = L - 2.0 * abs(ey)
-
+    ex = Mx / N; ey = My / N
+    A = B * L; q_avg = N / A
+    B_eff = B - 2.0 * abs(ex); L_eff = L - 2.0 * abs(ey)
     if (B_eff <= 0.0) or (L_eff <= 0.0):
         return float("inf"), float("inf"), ex, ey, B_eff, L_eff, False
-
-    in_kern = (abs(ex) <= B / 6.0) and (abs(ey) <= L / 6.0)
-
+    in_kern = (abs(ex) <= B/6.0) and (abs(ey) <= L/6.0)
     if in_kern:
-        q_max = q_avg * (1.0 + 6.0 * abs(ex) / B + 6.0 * abs(ey) / L)
+        q_max = q_avg * (1.0 + 6.0*abs(ex)/B + 6.0*abs(ey)/L)
     else:
         q_max = 2.0 * N / (B_eff * L_eff)
-
     q_req = N / (B_eff * L_eff)
     return q_req, q_max, ex, ey, B_eff, L_eff, in_kern
 
@@ -218,28 +218,30 @@ def costo_benchmark_usd(B, L, tcambio, tipo_benchmark):
     usd_m2 = CALDERON_USD_M2[tipo_benchmark]
     return area_m2 * usd_m2 * tcambio
 
+# ===================== Asentamiento (simple) =================
+ES_REF = {"Friccional": 25000.0, "Mixto (c-φ)": 15000.0, "Cohesivo": 8000.0}  # kPa
+NU_REF = 0.30
+S_ADM_MM = 25.0
+
+def asentamiento_elastico_mm(q_serv_kpa: float, B_m: float, tipo_suelo_cost: str) -> float:
+    Es = ES_REF.get(tipo_suelo_cost, 15000.0)
+    s_m = (q_serv_kpa * B_m * (1.0 - NU_REF**2)) / Es
+    return 1000.0 * s_m
+
 # ===================== Evaluación de una tripleta ===========
 def evaluar(B, L, h, ss):
-    q_req, q_max, ex, ey, B_eff, L_eff, in_kern = contact_pressures(
-        ss.N, ss.Mx, ss.My, B, L
-    )
-
-    qult, q_overburden, c_base, phi_base, gamma_base_eff = qult_estratificado(
-        ss.modelo, ss.D, B, ss.nivel_freatico
-    )
+    q_req, q_max, ex, ey, B_eff, L_eff, in_kern = contact_pressures(ss.N, ss.Mx, ss.My, B, L)
+    qult, q_overburden, c_base, phi_base, gamma_base_eff = qult_estratificado(ss.modelo, ss.D, B, ss.nivel_freatico, L=L)
     q_adm = qult / ss.FS
-
     margen = (q_adm - q_req) if np.isfinite(q_req) else -1e9
-    # >>> criterio adicional: q_max <= q_adm
     cumple = (q_adm >= q_req) and (q_adm >= q_max) and np.isfinite(q_req)
 
     tipo_suelo_cost = soil_category(c_base, phi_base)
     mult = SOIL_COST_MULT[tipo_suelo_cost] if ss.modo_costo == "Unitario + ajuste por suelo (Leyton 2025)" else 1.0
-
     costo_S, vol, acero_kg, excav = costo_modelo(B, L, h, ss.D, ss, mult_suelo=mult)
     costo_bench_S = costo_benchmark_usd(B, L, ss.tcambio, ss.tipo_benchmark)
-
     tipo_base = estrato_en(ss.D)["tipo"]
+
     return {
         "B": B, "L": L, "h": h,
         "B_eff": B_eff, "L_eff": L_eff,
@@ -254,10 +256,38 @@ def evaluar(B, L, h, ss):
         "tipo_suelo_cost": tipo_suelo_cost
     }
 
+# ===================== UI – Entrenamiento (sidebar) =========
+with st.sidebar:
+    st.markdown("### 🤖 Modelo ML (estilo paper)")
+    use_ml = st.toggle("Activar ML (si se entrena)", value=ML_STATE["enabled"])
+    up = st.file_uploader("CSV entrenamiento (gamma,B,D,phi,L_over_B,qu)", type=["csv"])
+    if st.button("Entrenar modelo", use_container_width=True):
+        if up is None:
+            st.warning("Sube primero un CSV válido.")
+        else:
+            try:
+                dfml = pd.read_csv(up)
+                miss = [c for c in (ML_FEATURES + ["qu"]) if c not in dfml.columns]
+                if miss:
+                    st.error(f"Faltan columnas: {miss}")
+                else:
+                    model, rmse = train_ml_from_df(dfml)
+                    ML_STATE["model"] = model
+                    ML_STATE["rmse"] = rmse
+                    ML_STATE["enabled"] = True
+                    st.success(f"Modelo entrenado. RMSE ≈ {rmse:,.3f} kPa")
+            except Exception as e:
+                st.error(f"Error: {e}")
+    ML_STATE["enabled"] = use_ml and (ML_STATE["model"] is not None)
+    if ML_STATE["enabled"] and ML_STATE["rmse"] is not None:
+        st.caption(f"ML activo • RMSE ≈ {ML_STATE['rmse']:,.3f} kPa")
+    elif use_ml and ML_STATE["model"] is None:
+        st.caption("Entrena para activar.")
+
 # ===================== UI – Perfil y Modelo ==================
 st.title("Optimización de Cimentaciones Superficiales")
 
-with st.expander("📋 Perfil de suelo (Proyecto 01) – usado automáticamente"):
+with st.expander("📋 Perfil de suelo – usado automáticamente"):
     df_perfil = pd.DataFrame(SOIL_PROFILE)[["z_from","z_to","tipo","c","phi","gamma"]]
     df_perfil.columns = ["Desde z (m)","Hasta z (m)","Tipo SUCS","c (kPa)","φ (°)","γ (kN/m³)"]
     st.dataframe(df_perfil, use_container_width=True, hide_index=True)
@@ -271,29 +301,21 @@ with c1:
 with c2:
     st.session_state.FS = st.number_input("FS capacidad", 1.5, 4.0, float(st.session_state.FS), 0.1)
 with c3:
-    st.session_state.modelo = st.selectbox(
-        "Modelo de capacidad",
-        ["Terzaghi","Meyerhof","Hansen"],
-        index=["Terzaghi","Meyerhof","Hansen"].index(st.session_state.modelo)
-    )
+    st.session_state.modelo = st.selectbox("Modelo de capacidad", ["Terzaghi","Meyerhof","Hansen"],
+                                           index=["Terzaghi","Meyerhof","Hansen"].index(st.session_state.modelo))
 
 # info del estrato en D
 cD, phiD, gD, tipoD = params_en_base(st.session_state.D, st.session_state.nivel_freatico)
 q_over = sobrecarga_efectiva(st.session_state.D, st.session_state.nivel_freatico)
-st.info(
-    f"**En D = {st.session_state.D:.2f} m (estrato {tipoD})** → "
-    f"c = **{cD:.1f} kPa**, φ = **{phiD:.1f}°**, γₑₑf = **{gD:.2f} kN/m³**, "
-    f"σ′v(D) = **{q_over:.1f} kPa**, **Modelo** = **{st.session_state.modelo}**"
-)
+st.info(f"**En D = {st.session_state.D:.2f} m (estrato {tipoD})** → "
+        f"c = **{cD:.1f} kPa**, φ = **{phiD:.1f}°**, γₑₑf = **{gD:.2f} kN/m³**, "
+        f"σ′v(D) = **{q_over:.1f} kPa**, **Modelo** = **{st.session_state.modelo}**")
 
-# === Visor de factores Nc, Nq, Nγ ===
 with st.expander("📘 Factores de capacidad (según φ)"):
     Nc0, Nq0, Ng0 = bearing_capacity_factors(phiD)
     coef = "sₙc=1.3, sₙq=1.2, sₙγ=0.8" if st.session_state.modelo=="Terzaghi" else "sₙc=1.3, sₙq=1.2, sₙγ=1.0"
-    st.markdown(
-        f"**En φ = {phiD:.1f}°** → **Nc = {Nc0:.2f}**, **Nq = {Nq0:.2f}**, **Nγ = {Ng0:.2f}**  \n"
-        f"*Coeficientes de forma usados:* {coef}"
-    )
+    st.markdown(f"**En φ = {phiD:.1f}°** → **Nc = {Nc0:.2f}**, **Nq = {Nq0:.2f}**, **Nγ = {Ng0:.2f}**  \n"
+                f"*Coeficientes de forma usados:* {coef}")
     phis = np.arange(0, 51, 1)
     data = [[ph, *bearing_capacity_factors(ph)] for ph in phis]
     df_fac = pd.DataFrame(data, columns=["φ (°)","Nc","Nq","Nγ"])
@@ -326,11 +348,9 @@ if usar_norma:
     st.session_state.N = float(N_calc)
     st.session_state.Mx = float(N_calc * ex_in)
     st.session_state.My = float(N_calc * ey_in)
-    st.success(
-        f"Se asignó **N = {st.session_state.N:.1f} kN**, "
-        f"**Mx = {st.session_state.Mx:.1f} kN·m**, **My = {st.session_state.My:.1f} kN·m** "
-        f"(uso: {uso}, LL = {q_LL:.2f} kPa, DL = {q_DL:.2f} kPa, área = {area:.2f} m², niveles = {niveles})."
-    )
+    st.success(f"Se asignó **N = {st.session_state.N:.1f} kN**, "
+               f"**Mx = {st.session_state.Mx:.1f} kN·m**, **My = {st.session_state.My:.1f} kN·m** "
+               f"(uso: {uso}, LL = {q_LL:.2f} kPa, DL = {q_DL:.2f} kPa, área = {area:.2f} m², niveles = {niveles}).")
 
 # ===================== UI – Cargas manuales ==================
 st.markdown("### 🏗️ Cargas manuales (si prefieres)")
@@ -367,23 +387,16 @@ with e3:
         list(CALDERON_USD_M2.keys()),
         index=list(CALDERON_USD_M2.keys()).index(st.session_state.tipo_benchmark)
     )
-
-st.caption("La optimización usa el **modo de costo** seleccionado; el **benchmark Calderón 2015** se muestra a modo comparativo.")
+st.caption("La optimización usa el **modo de costo** seleccionado; el **benchmark** se muestra comparativo.")
 
 st.markdown("### 🔎 Rangos de B, L, h")
 r1, r2, r3 = st.columns(3)
 with r1:
-    st.session_state.B_min, st.session_state.B_max = st.slider(
-        "Base B (m)", 0.5, 8.0, (float(st.session_state.B_min), float(st.session_state.B_max))
-    )
+    st.session_state.B_min, st.session_state.B_max = st.slider("Base B (m)", 0.5, 8.0, (float(st.session_state.B_min), float(st.session_state.B_max)))
 with r2:
-    st.session_state.L_min, st.session_state.L_max = st.slider(
-        "Largo L (m)", 0.5, 8.0, (float(st.session_state.L_min), float(st.session_state.L_max))
-    )
+    st.session_state.L_min, st.session_state.L_max = st.slider("Largo L (m)", 0.5, 8.0, (float(st.session_state.L_min), float(st.session_state.L_max)))
 with r3:
-    st.session_state.h_min, st.session_state.h_max = st.slider(
-        "Espesor h (m)", 0.3, 2.5, (float(st.session_state.h_min), float(st.session_state.h_max))
-    )
+    st.session_state.h_min, st.session_state.h_max = st.slider("Espesor h (m)", 0.3, 2.5, (float(st.session_state.h_min), float(st.session_state.h_max)))
 
 g1, g2, g3 = st.columns(3)
 with g1:
@@ -408,10 +421,9 @@ if st.button("🚀 Analizar soluciones", use_container_width=True):
     df = pd.DataFrame(rows)
     df_ok = df[df["cumple"]].copy()
     if df_ok.empty:
-        st.error("⚠️ No hay soluciones que cumplan. Sube B/L/D o baja Mx/My/FS (o revisa q_max).")
+        st.error("⚠️ No hay soluciones que cumplan. Sube B/L/D o baja Mx/My/FS (revisa q_max).")
         st.stop()
 
-    # nombres claros
     nice = {
         "B":"Base B (m)","L":"Largo L (m)","h":"Espesor h (m)",
         "B_eff":"Base efectiva B′ (m)","L_eff":"Largo efectivo L′ (m)",
@@ -432,16 +444,27 @@ if st.button("🚀 Analizar soluciones", use_container_width=True):
     }
     df_view = df_ok.rename(columns=nice)
 
+    # === Asentamiento y filtro adicional (s ≤ s_adm) ===
+    df_view["Asentamiento (mm)"] = df_view.apply(
+        lambda r: asentamiento_elastico_mm(
+            r["Presión de contacto requerida (kPa)"],
+            r["Base B (m)"],
+            r["Tipo de suelo (costos)"]
+        ),
+        axis=1
+    )
+    df_view = df_view[df_view["Asentamiento (mm)"] <= S_ADM_MM].copy()
+    if df_view.empty:
+        st.error(f"⚠️ No hay soluciones que cumplan también asentamiento ≤ {S_ADM_MM:.0f} mm.")
+        st.stop()
+
     # ===================== KPIs ============================
     mejor_idx = df_view["Costo estimado (S/)"].idxmin()
     mejor = df_view.loc[mejor_idx]
 
     p25 = df_view["Costo estimado (S/)"].quantile(0.25)
     df_rob = df_view[df_view["Costo estimado (S/)"] <= p25]
-    robusta = df_rob.sort_values(
-        ["Margen de seguridad (kPa)","Costo estimado (S/)"],
-        ascending=[False,True]
-    ).iloc[0]
+    robusta = df_rob.sort_values(["Margen de seguridad (kPa)","Costo estimado (S/)"], ascending=[False,True]).iloc[0]
 
     k1,k2,k3,k4 = st.columns(4)
     k1.metric("Soluciones viables", f"{len(df_view):,}")
@@ -452,22 +475,49 @@ if st.button("🚀 Analizar soluciones", use_container_width=True):
     # Clasificación superficial/profunda
     B_char = min(float(mejor['Base B (m)']), float(mejor['Largo L (m)']))
     eta = float(st.session_state.D) / B_char
-    if eta <= 1.0:
-        clase_cimentacion = "CIMENTACIÓN SUPERFICIAL (zapata)"
-    elif eta <= 3.0:
-        clase_cimentacion = "CIMENTACIÓN SUPERFICIAL (semiprofunda)"
-    elif eta <= 4.0:
-        clase_cimentacion = "ZONA DE TRANSICIÓN (revisar opción profunda)"
-    else:
-        clase_cimentacion = "CIMENTACIÓN PROFUNDA (pilotes/pozos)"
+    if eta <= 1.0: clase_cimentacion = "CIMENTACIÓN SUPERFICIAL (zapata)"
+    elif eta <= 3.0: clase_cimentacion = "CIMENTACIÓN SUPERFICIAL (semiprofunda)"
+    elif eta <= 4.0: clase_cimentacion = "ZONA DE TRANSICIÓN (revisar opción profunda)"
+    else: clase_cimentacion = "CIMENTACIÓN PROFUNDA (pilotes/pozos)"
     st.metric("Clasificación (D / min(B,L))", f"{clase_cimentacion}", f"{eta:.2f}")
 
-    # ===================== Top 10 ==========================
-    st.subheader("Top 10 soluciones por menor costo")
-    st.dataframe(
-        df_view.sort_values("Costo estimado (S/)").head(10),
-        use_container_width=True
+    # ===================== FO1 vs FO2 =======================
+    df_view["Índice costo/margen"] = (
+        df_view["Costo estimado (S/)"] /
+        df_view["Margen de seguridad (kPa)"].replace(0, np.nan)
     )
+    fo2_b = df_view.sort_values("Índice costo/margen").iloc[0]  # eficiencia
+    st.subheader("🧮 Comparación de funciones objetivo")
+    colfo1, colfo3 = st.columns(2)
+    with colfo1:
+        st.markdown("**FO1 – Min. costo**")
+        st.write(f"B={mejor['Base B (m)']:.2f} m, L={mejor['Largo L (m)']:.2f} m, h={mejor['Espesor h (m)']:.2f} m")
+        st.write(f"Costo: S/ {mejor['Costo estimado (S/)']:.2f}")
+        st.write(f"Margen: {mejor['Margen de seguridad (kPa)']:.1f} kPa")
+        st.write(f"Asent.: {mejor['Asentamiento (mm)']:.1f} mm")
+    with colfo3:
+        st.markdown("**FO2 – Min. (Costo/Margen)**")
+        st.write(f"B={fo2_b['Base B (m)']:.2f} m, L={fo2_b['Largo L (m)']:.2f} m, h={fo2_b['Espesor h (m)']:.2f} m")
+        st.write(f"Costo: S/ {fo2_b['Costo estimado (S/)']:.2f}")
+        st.write(f"Margen: {fo2_b['Margen de seguridad (kPa)']:.1f} kPa")
+        st.write(f"Asent.: {fo2_b['Asentamiento (mm)']:.1f} mm")
+
+    # ====== Decisión automática (IA) ======
+    def decide_recomendacion(fo1, fo2):
+        c1, c2 = fo1["Costo estimado (S/)"], fo2["Costo estimado (S/)"]
+        s1, s2 = fo1["Asentamiento (mm)"], fo2["Asentamiento (mm)"]
+        m1, m2 = fo1["Margen de seguridad (kPa)"], fo2["Margen de seguridad (kPa)"]
+        if (s1 - s2 >= 5.0) and (m2 - m1 >= 50.0) and (c2 <= 1.05 * c1):
+            motivo = ("Se selecciona la alternativa orientada al desempeño porque reduce "
+                      f"el asentamiento en {s1 - s2:.1f} mm y aumenta el margen en {m2 - m1:.1f} kPa "
+                      "con un costo prácticamente equivalente (≤ 5% mayor).")
+            return fo2, motivo
+        else:
+            motivo = ("Se selecciona la alternativa de **menor costo**, dado que las mejoras de desempeño "
+                      "de la otra opción no justifican sobrecosto o son marginales.")
+            return fo1, motivo
+
+    eleccion, razon = decide_recomendacion(mejor, fo2_b)
 
     # ===================== Gráficos ========================
     st.subheader("Visualizaciones")
@@ -477,16 +527,12 @@ if st.button("🚀 Analizar soluciones", use_container_width=True):
             df_view, x="Base B (m)", y="Largo L (m)",
             color="Costo estimado (S/)", size="Espesor h (m)",
             hover_data=[
-                "Presión de contacto requerida (kPa)",
-                "Presión máxima de contacto q_max (kPa)",
-                "Capacidad admisible del suelo (kPa)",
-                "Margen de seguridad (kPa)",
-                "Base efectiva B′ (m)","Largo efectivo L′ (m)",
-                "Tipo de suelo (costos)",
-                "Volumen de concreto (m³)","Acero (kg)","Excavación (m³)",
-                "Costo benchmark Calderón (S/)"
+                "Presión de contacto requerida (kPa)","Presión máxima de contacto q_max (kPa)",
+                "Capacidad admisible del suelo (kPa)","Margen de seguridad (kPa)",
+                "Base efectiva B′ (m)","Largo efectivo L′ (m)","Tipo de suelo (costos)",
+                "Volumen de concreto (m³)","Acero (kg)","Excavación (m³)","Costo benchmark Calderón (S/)"
             ],
-            title="Soluciones viables (color = costo, tamaño = h)"
+            title="Soluciones viables (color=costo, tamaño=h)"
         )
         st.plotly_chart(fig1, use_container_width=True)
     with c2:
@@ -497,7 +543,7 @@ if st.button("🚀 Analizar soluciones", use_container_width=True):
         )
         st.plotly_chart(fig2, use_container_width=True)
 
-    # ===================== Estadística (en español) =========
+    # ===================== Estadística ======================
     st.subheader("📈 Estadística descriptiva (soluciones viables)")
     columnas_resumen = {
         "Costo estimado (S/)":"Costo modelo (S/)",
@@ -507,69 +553,59 @@ if st.button("🚀 Analizar soluciones", use_container_width=True):
         "Capacidad admisible del suelo (kPa)":"Capacidad admisible (kPa)",
         "Margen de seguridad (kPa)":"Margen de seguridad (kPa)",
         "Base B (m)":"Base B (m)","Largo L (m)":"Largo L (m)","Espesor h (m)":"Espesor h (m)",
+        "Asentamiento (mm)":"Asentamiento (mm)"
     }
     def resumen(serie):
         s = pd.to_numeric(serie, errors="coerce").dropna()
-        if s.empty:
-            return [0,None,None,None,None,None,None,None]
-        return [
-            int(s.count()), float(s.mean()),
-            float(s.std(ddof=1)) if s.count()>1 else 0.0,
-            float(s.min()), float(np.percentile(s,25)),
-            float(np.percentile(s,50)), float(np.percentile(s,75)),
-            float(s.max())
-        ]
+        if s.empty: return [0,None,None,None,None,None,None,None]
+        return [int(s.count()), float(s.mean()),
+                float(s.std(ddof=1)) if s.count()>1 else 0.0,
+                float(s.min()), float(np.percentile(s,25)),
+                float(np.percentile(s,50)), float(np.percentile(s,75)),
+                float(s.max())]
     filas=[]
     for col, nom in columnas_resumen.items():
         vals = resumen(df_view[col]); filas.append([nom]+vals)
     df_stats = pd.DataFrame(
         filas,
-        columns=["Variable","Cantidad de soluciones","Promedio","Desviación estándar",
-                 "Mínimo","Percentil 25 (Q1)","Mediana (Q2)","Percentil 75 (Q3)","Máximo"]
+        columns=["Variable","Cantidad","Promedio","Desv. estándar","Mínimo","Q1","Mediana","Q3","Máximo"]
     )
     st.dataframe(df_stats, use_container_width=True, hide_index=True)
 
     with st.expander("ℹ️ Definiciones rápidas"):
         st.markdown(
-            "- **Presión requerida**: N /(B′·L′), usando excentricidades (área efectiva).  \n"
-            "- **Presión máxima de contacto q_max**: se verifica que **q_max ≤ q_adm**.  \n"
-            "  • Dentro del núcleo (|eₓ|≤B/6 y |eᵧ|≤L/6): q_max = q_avg·(1 + 6|eₓ|/B + 6|eᵧ|/L).  \n"
-            "  • Fuera del núcleo: método del **área efectiva**, aproximación **q_max ≈ 2·N/(B′·L′)**.  \n"
-            "- **Capacidad admisible**: qult/FS con c, φ y γ del estrato de apoyo y σ′v(D) acumulada. "
-            f"**Modelo**: {st.session_state.modelo} (coef. de forma: "
-            f"{'1.3/1.2/0.8' if st.session_state.modelo=='Terzaghi' else '1.3/1.2/1.0'}).  \n"
-            "- **Clasificación**: D/min(B,L) ≤ 1 superficial; 1–3 semiprofunda; 3–4 transición; >4 profunda."
+            "- **Presión requerida**: N /(B′·L′) con excentricidades (área efectiva).  \n"
+            "- **q_max**: se verifica **q_max ≤ q_adm** (núcleo vs área efectiva).  \n"
+            "- **Capacidad admisible**: q_ult/FS con c, φ, γ en base y σ′v(D).  \n"
+            "- **Asentamiento**: estimación elástica s ≈ q·B·(1-ν²)/Eₛ (25 mm admisible).  \n"
+            "- **FO1**: costo mínimo. **FO2**: mínimo (Costo/Margen)."
         )
 
-    # ===================== Recomendación ===================
+    # ===================== Recomendación ====================
     st.markdown("## ✅ Recomendación automática")
+    Bsel, Lsel, hsel = eleccion['Base B (m)'], eleccion['Largo L (m)'], eleccion['Espesor h (m)']
     texto = (
-        f"**Modelo de capacidad seleccionado:** **{st.session_state.modelo}**  \n"
+        f"**Modelo de capacidad:** **{st.session_state.modelo}**  \n"
         f"**Modo de costo:** **{st.session_state.modo_costo}**  \n"
-        f"**Benchmark:** **{st.session_state.tipo_benchmark}** (Calderón 2015), TC = {st.session_state.tcambio:.2f} S//USD.  \n\n"
-        "**Opción de mínimo costo (modelo seleccionado)**  \n"
-        f"- B = **{mejor['Base B (m)']:.2f} m**, L = **{mejor['Largo L (m)']:.2f} m**, "
-        f"h = **{mejor['Espesor h (m)']:.2f} m**  \n"
-        f"- Presión requerida = **{mejor['Presión de contacto requerida (kPa)']:.1f} kPa**  \n"
-        f"- **q_max** = **{mejor['Presión máxima de contacto q_max (kPa)']:.1f} kPa**  \n"
-        f"- Capacidad admisible = **{mejor['Capacidad admisible del suelo (kPa)']:.1f} kPa**  \n"
-        f"- Margen de seguridad = **{mejor['Margen de seguridad (kPa)']:.1f} kPa**  \n"
-        f"- **Costo estimado (modelo)** = **S/ {mejor['Costo estimado (S/)']:.2f}**  \n"
-        f"- **Costo benchmark (Calderón)** = **S/ {mejor['Costo benchmark Calderón (S/)']:.2f}**  \n\n"
-        "**Opción robusta (≤ P25 de costo y mayor margen)**  \n"
-        f"- B = **{robusta['Base B (m)']:.2f} m**, L = **{robusta['Largo L (m)']:.2f} m**, "
-        f"h = **{robusta['Espesor h (m)']:.2f} m**  \n"
-        f"- Presión requerida = **{robusta['Presión de contacto requerida (kPa)']:.1f} kPa**, "
-        f"**q_max** = **{robusta['Presión máxima de contacto q_max (kPa)']:.1f} kPa**  \n"
-        f"- Capacidad admisible = **{robusta['Capacidad admisible del suelo (kPa)']:.1f} kPa**  \n"
-        f"- **Costo estimado (modelo)** = **S/ {robusta['Costo estimado (S/)']:.2f}**  \n\n"
-        f"**Clasificación geométrica** (con la solución de mínimo costo): "
-        f"D/min(B,L) = **{eta:.2f}** → **{clase_cimentacion}**.  \n"
-        f"*(Falta verificar asentamientos y punzonamiento según la norma del curso.)*"
+        f"**Benchmark:** **{st.session_state.tipo_benchmark}** (Calderón), TC = {st.session_state.tcambio:.2f} S//USD.  \n\n"
+        "**Alternativa seleccionada (criterio IA):**  \n"
+        f"- B = **{Bsel:.2f} m**, L = **{Lsel:.2f} m**, h = **{hsel:.2f} m**  \n"
+        f"- Presión requerida = **{eleccion['Presión de contacto requerida (kPa)']:.1f} kPa**  \n"
+        f"- **q_max** = **{eleccion['Presión máxima de contacto q_max (kPa)']:.1f} kPa**  \n"
+        f"- Capacidad admisible = **{eleccion['Capacidad admisible del suelo (kPa)']:.1f} kPa**  \n"
+        f"- **Asentamiento** = **{eleccion['Asentamiento (mm)']:.1f} mm** (≤ {S_ADM_MM:.0f} mm)  \n"
+        f"- Margen de seguridad = **{eleccion['Margen de seguridad (kPa)']:.1f} kPa**  \n"
+        f"- **Costo estimado** = **S/ {eleccion['Costo estimado (S/)']:.2f}**  \n"
+        f"- **Costo benchmark** = **S/ {eleccion['Costo benchmark Calderón (S/)']:.2f}**  \n\n"
+        f"**Decisión:** {razon}"
     )
     st.markdown(texto)
 
-    # ===================== Exportación =====================
+    if eleccion.equals(fo2_b) and (fo2_b["Costo estimado (S/)"] < mejor["Costo estimado (S/)"]):
+        st.info("La opción de desempeño (FO2) resultó incluso más económica que la FO1. "
+                "Se mantiene la selección por ofrecer menor asentamiento y mayor margen a costo equivalente.")
+
+    # ===================== Exportación ======================
     st.subheader("📥 Exportar soluciones")
     csv_sol = df_view.sort_values("Costo estimado (S/)").to_csv(index=False)
     st.download_button(
@@ -579,6 +615,7 @@ if st.button("🚀 Analizar soluciones", use_container_width=True):
         mime="text/csv",
         use_container_width=True,
     )
+
 
 
 
