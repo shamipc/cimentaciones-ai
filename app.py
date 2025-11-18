@@ -1,6 +1,7 @@
 # app.py — versión mínima con 2 funciones objetivo (FO1 costo, FO2 asentamiento)
 # Verifica: q_serv ≤ q_adm, q_max ≤ q_adm y s ≤ s_adm
-# ML opcional (paper): si se entrena y activas el switch, predice qu con ML; si no, usa Meyerhof.
+# ML opcional (paper) con APRENDIZAJE DE RESIDUO:
+#     qu = qu_meyerhof + residuo_ML(gamma,B,D,phi,L/B,D/B,q_eff)
 
 import math
 import numpy as np
@@ -9,16 +10,17 @@ import streamlit as st
 
 # ====== ML opcional (con importación defensiva) ======
 try:
-    from sklearn.model_selection import train_test_split, GridSearchCV
+    from sklearn.model_selection import train_test_split
     from sklearn.ensemble import GradientBoostingRegressor
+    from sklearn.metrics import mean_squared_error
     SKLEARN_OK = True
 except Exception:
     SKLEARN_OK = False
-    train_test_split = GridSearchCV = GradientBoostingRegressor = None
+    train_test_split = GradientBoostingRegressor = mean_squared_error = None
 
 st.set_page_config(page_title="Optimización de Cimentaciones — Minimal", layout="centered")
 st.title("Optimización de Cimentaciones (mínima)")
-st.caption("Entradas mínimas (paper) + 2 funciones objetivo (FO1 costo, FO2 asentamiento) con verificación de servicio.")
+st.caption("Entradas mínimas (paper) + 2 funciones objetivo (FO1 costo, FO2 asentamiento) con verificación de servicio y ML opcional por residuo vs Meyerhof.")
 
 # ======================== Entradas mínimas ========================
 c1, c2 = st.columns(2)
@@ -47,67 +49,24 @@ with c5:
 
 st.markdown("---")
 
-# ======================== ML opcional (paper) ========================
+# ======================== Estado global ML ========================
+if "ML_MODEL" not in st.session_state:
+    st.session_state.ML_MODEL = None
+if "RMSE_ML" not in st.session_state:
+    st.session_state.RMSE_ML = None
+if "REL_RMSE_ML" not in st.session_state:
+    st.session_state.REL_RMSE_ML = None
+
+# ======================== ML opcional (paper) =====================
 st.subheader("ML opcional (paper)")
 if not SKLEARN_OK:
     st.warning("Para usar ML, agrega `scikit-learn>=1.3,<1.5` en requirements.txt. "
                "Si no, se usará el método clásico (Meyerhof).")
 
-# Estados globales mínimos
-if "ML_MODEL" not in st.session_state:
-    st.session_state.ML_MODEL = None
-if "RMSE_ML" not in st.session_state:
-    st.session_state.RMSE_ML = None
-
 up = st.file_uploader("CSV entrenamiento (gamma,B,D,phi,L_over_B,qu)", type=["csv"])
 use_ml = st.toggle("Usar modelo ML si está entrenado", value=False)
 
-def train_ml(csv):
-    df = pd.read_csv(csv)
-    req = ["gamma", "B", "D", "phi", "L_over_B", "qu"]
-    miss = [c for c in req if c not in df.columns]
-    if miss:
-        raise ValueError(f"Faltan columnas: {miss}")
-
-    X = df[["gamma", "B", "D", "phi", "L_over_B"]]
-    y = df["qu"].astype(float)
-
-    Xtr, Xva, ytr, yva = train_test_split(X, y, test_size=0.20, random_state=42)
-
-    gbr = GradientBoostingRegressor(random_state=42)
-    grid = GridSearchCV(
-        gbr,
-        {"n_estimators": [150, 300, 500],
-         "max_depth": [2, 3],
-         "learning_rate": [0.05, 0.1],
-         "min_samples_leaf": [3, 5]},
-        cv=5,
-        scoring="neg_root_mean_squared_error",
-        n_jobs=-1
-    )
-    grid.fit(Xtr, ytr)
-    best = grid.best_estimator_
-
-    # RMSE en validación
-    yhat = best.predict(Xva)
-    rmse = float(np.sqrt(np.mean((yva - yhat) ** 2)))
-    return best, rmse
-
-if st.button("Entrenar modelo", use_container_width=True):
-    if not SKLEARN_OK:
-        st.error("scikit-learn no está disponible en el entorno.")
-    elif up is None:
-        st.warning("Sube un CSV válido con columnas: gamma,B,D,phi,L_over_B,qu.")
-    else:
-        try:
-            model, rmse = train_ml(up)
-            st.session_state.ML_MODEL = model
-            st.session_state.RMSE_ML = rmse
-            st.success(f"Modelo entrenado. RMSE≈ {rmse:,.2f} kPa")
-        except Exception as e:
-            st.error(f"Error entrenando: {e}")
-
-# ======================== Capacidad última ========================
+# ====== Capacidad clásica (Meyerhof) ======
 def bearing_factors(phi_deg: float):
     phi_rad = math.radians(phi_deg)
     if phi_rad < 1e-6:
@@ -125,15 +84,118 @@ def qult_meyerhof(B, D, phi, gamma):
     q_eff = gamma * D
     return q_eff * Nq * sq + 0.5 * gamma * B * Ng * sg
 
+# ====== ENTRENAMIENTO: aprendizaje de residuo (recomendado) ======
+def train_ml(csv):
+    """
+    Entrena ML para predecir el RESIDUO respecto a Meyerhof:
+        residuo y = qu_real - qu_meyerhof
+    En inferencia: qu_pred = qu_meyerhof + y_hat
+    Devuelve: modelo, RMSE(kPa) y RMSE relativo (%) vs mediana(qu) de validación.
+    """
+    if not SKLEARN_OK:
+        raise RuntimeError("scikit-learn no disponible en el entorno.")
+
+    df = pd.read_csv(csv).copy()
+    req = ["gamma", "B", "D", "phi", "L_over_B", "qu"]
+    miss = [c for c in req if c not in df.columns]
+    if miss:
+        raise ValueError(f"Faltan columnas: {miss}")
+
+    # Features físicos adicionales
+    df["D_over_B"] = df["D"] / np.clip(df["B"], 1e-9, None)
+    df["q_eff"]    = df["gamma"] * df["D"]
+
+    # Base clásica por fila
+    def qu_meyerhof_row(r):
+        Nc, Nq, Ng = bearing_factors(r["phi"])
+        sc, sq, sg = 1.3, 1.2, 1.0
+        q_eff = r["gamma"] * r["D"]
+        return q_eff * Nq * sq + 0.5 * r["gamma"] * r["B"] * Ng * sg
+
+    qu_m = df.apply(qu_meyerhof_row, axis=1)
+
+    # Objetivo: residuo
+    y = (df["qu"].astype(float).values - qu_m.values)
+    feat_cols = ["gamma", "B", "D", "phi", "L_over_B", "D_over_B", "q_eff"]
+    X = df[feat_cols].astype(float).values
+
+    # Partición 80/20 (estratificada levemente por phi)
+    phi_bins = pd.cut(df["phi"], bins=[0, 25, 30, 35, 40, 50], labels=False, include_lowest=True)
+    Xtr, Xva, ytr, yva, qm_tr, qm_va = train_test_split(
+        X, y, qu_m.values, test_size=0.20, random_state=42, stratify=phi_bins
+    )
+
+    # Modelo robusto a outliers
+    gbr = GradientBoostingRegressor(
+        loss="huber",
+        n_estimators=600,
+        learning_rate=0.05,
+        max_depth=3,
+        min_samples_leaf=5,
+        random_state=42,
+    )
+    gbr.fit(Xtr, ytr)
+
+    # Métricas en validación (RMSE en kPa y relativo %)
+    yhat_res = gbr.predict(Xva)
+    qu_pred  = qm_va + yhat_res
+    qu_true  = qm_va + yva
+    rmse     = float(np.sqrt(mean_squared_error(qu_true, qu_pred)))
+    med_qu   = float(np.median(qu_true))
+    rel_rmse = float(100.0 * rmse / max(1.0, med_qu))
+
+    # Guardar metadatos mínimos para inferencia
+    gbr._feat_cols = feat_cols
+    gbr._use_residual = True
+    return gbr, rmse, rel_rmse
+
+if st.button("Entrenar modelo", use_container_width=True):
+    if not SKLEARN_OK:
+        st.error("scikit-learn no está disponible en el entorno.")
+    elif up is None:
+        st.warning("Sube un CSV válido con columnas: gamma,B,D,phi,L_over_B,qu.")
+    else:
+        try:
+            model, rmse, rel_rmse = train_ml(up)
+            st.session_state.ML_MODEL = model
+            st.session_state.RMSE_ML = rmse
+            st.session_state.REL_RMSE_ML = rel_rmse
+            st.success(f"Modelo entrenado. RMSE≈ {rmse:,.2f} kPa (≈ {rel_rmse:.1f}% de la mediana de qu)")
+        except Exception as e:
+            st.error(f"Error entrenando: {e}")
+
+# ====== Predicción de qu (usa ML residual si procede) ======
 def qult_pred(gamma_val, B, D, phi_val, L_over_B_val):
-    """Predicción de qu: usa ML si está entrenado y el switch está activo; si no, Meyerhof."""
+    """
+    qu: ML residual (si entrenado y switch activo) o Meyerhof (clásico).
+    En residual: qu = qu_meyerhof + residuo_ML(...)
+    """
+    # Siempre calcula la base clásica (ancla física)
+    Nc, Nq, Ng = bearing_factors(phi_val)
+    sc, sq, sg = 1.3, 1.2, 1.0
+    q_eff = gamma_val * D
+    qu_base = q_eff * Nq * sq + 0.5 * gamma_val * B * Ng * sg
+
     if use_ml and (st.session_state.ML_MODEL is not None) and SKLEARN_OK:
-        X = pd.DataFrame([{
-            "gamma": gamma_val, "B": B, "D": D, "phi": phi_val, "L_over_B": L_over_B_val
-        }])
-        return float(st.session_state.ML_MODEL.predict(X)[0])
+        mdl = st.session_state.ML_MODEL
+        if getattr(mdl, "_use_residual", False):
+            X = pd.DataFrame([{
+                "gamma": gamma_val, "B": B, "D": D, "phi": phi_val,
+                "L_over_B": L_over_B_val,
+                "D_over_B": D / max(B, 1e-9),
+                "q_eff": q_eff
+            }])
+            res = float(mdl.predict(X[mdl._feat_cols])[0])
+            return max(0.0, qu_base + res)
+        else:
+            # (fallback por si se entrenó un modelo directo accidentalmente)
+            X = pd.DataFrame([{
+                "gamma": gamma_val, "B": B, "D": D, "phi": phi_val, "L_over_B": L_over_B_val
+            }])
+            return float(mdl.predict(X)[0])
+
     # Clásico
-    return qult_meyerhof(B, D, phi_val, gamma_val)
+    return qu_base
 
 # ======================== Servicio y asentamiento =============
 def contact_pressures(N, B, L, ex=0.0, ey=0.0):
@@ -196,7 +258,10 @@ if st.button("🚀 Optimizar (FO1 & FO2)"):
 
     # ===== Banner del modelo usado =====
     if use_ml and (st.session_state.ML_MODEL is not None) and SKLEARN_OK:
-        st.success(f"Modelo de capacidad usado: **ML (paper)** — RMSE≈ {st.session_state.RMSE_ML:,.2f} kPa")
+        txt = f"Modelo de capacidad usado: **ML (residuo vs. Meyerhof)** — RMSE≈ {st.session_state.RMSE_ML:,.2f} kPa"
+        if st.session_state.REL_RMSE_ML is not None:
+            txt += f" (≈ {st.session_state.REL_RMSE_ML:.1f}% de la mediana de qu)"
+        st.success(txt)
     else:
         st.success("Modelo de capacidad usado: **Meyerhof (clásico)**")
 
