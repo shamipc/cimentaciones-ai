@@ -1,6 +1,7 @@
 # app.py — versión mínima con 2 funciones objetivo (FO1 costo, FO2 asentamiento)
 # Verifica: q_serv ≤ q_adm, q_max ≤ q_adm y s ≤ s_adm
-# ML opcional (paper) con APRENDIZAJE DE RESIDUO: qu = qu_meyerhof + ML(gamma,B,D,phi,L/B,D/B)
+# ML opcional (paper) con APRENDIZAJE DE RESIDUO:
+#     qu = qu_meyerhof + λ · ML(gamma,B,D,phi,L/B,D/B)
 
 import math
 import numpy as np
@@ -53,6 +54,8 @@ if "ML_MODEL" not in st.session_state:
     st.session_state.ML_MODEL = None
 if "RMSE_ML" not in st.session_state:
     st.session_state.RMSE_ML = None
+if "lambda_res" not in st.session_state:
+    st.session_state.lambda_res = 1.0  # ponderación de la corrección ML
 
 # ======================== ML opcional (paper) =====================
 st.subheader("ML opcional (paper)")
@@ -62,6 +65,12 @@ if not SKLEARN_OK:
 
 up = st.file_uploader("CSV entrenamiento (gamma,B,D,phi,L_over_B,qu)", type=["csv"])
 use_ml = st.toggle("Usar modelo ML si está entrenado", value=False)
+
+# Ponderación de la corrección ML (conservadurismo)
+st.session_state.lambda_res = st.slider(
+    "Ponderación de la corrección ML (λ)", 0.0, 1.0, st.session_state.lambda_res, 0.05,
+    help="λ=1 usa toda la corrección ML; λ<1 la atenúa (más conservador, más cercano a Meyerhof)."
+)
 
 # ====== Capacidad clásica (Meyerhof) ======
 def bearing_factors(phi_deg: float):
@@ -86,7 +95,7 @@ def train_ml(csv):
     """
     Entrena ML para predecir qu vía residuo:
       residuo y = qu_real - qu_meyerhof
-    En inferencia: qu_pred = qu_meyerhof + y_hat
+    En inferencia: qu_pred = qu_meyerhof + λ · y_hat
     """
     if not SKLEARN_OK:
         raise RuntimeError("scikit-learn no disponible en el entorno.")
@@ -97,26 +106,21 @@ def train_ml(csv):
     if miss:
         raise ValueError(f"Faltan columnas: {miss}")
 
-    # feature adicional adimensional
     df["D_over_B"] = df["D"] / np.clip(df["B"], 1e-9, None)
 
-    # base (Meyerhof) para residuo
     qu_m = df.apply(lambda r: qult_meyerhof(r["B"], r["D"], r["phi"], r["gamma"]), axis=1)
 
-    # objetivo: residuo
     y = (df["qu"] - qu_m).astype(float).values
     feat_cols = ["gamma", "B", "D", "phi", "L_over_B", "D_over_B"]
     X = df[feat_cols].astype(float).values
 
-    # estratifica levemente por phi para estabilidad
     phi_bins = pd.cut(df["phi"], bins=[0, 25, 30, 35, 40, 50], labels=False, include_lowest=True)
     Xtr, Xva, ytr, yva, qm_tr, qm_va = train_test_split(
         X, y, qu_m.values, test_size=0.20, random_state=42, stratify=phi_bins
     )
 
-    # Gradient Boosting robusto (Huber)
     gbr = GradientBoostingRegressor(
-        loss="huber",
+        loss="huber",            # robusto a outliers
         n_estimators=600,
         learning_rate=0.05,
         max_depth=3,
@@ -125,13 +129,11 @@ def train_ml(csv):
     )
     gbr.fit(Xtr, ytr)
 
-    # reconstruimos qu en validación
     yhat_res = gbr.predict(Xva)
     qu_pred = qm_va + yhat_res
     qu_true = qm_va + yva
     rmse = float(np.sqrt(mean_squared_error(qu_true, qu_pred)))
 
-    # adjunta metadatos para inferencia
     gbr._feat_cols = feat_cols
     gbr._use_residual = True
     return gbr, rmse
@@ -150,28 +152,24 @@ if st.button("Entrenar modelo", use_container_width=True):
 
 # ====== Predicción de qu (usa ML si procede) ======
 def qult_pred(gamma_val, B, D, phi_val, L_over_B_val):
-    """qu: ML (si entrenado y switch activo) o Meyerhof."""
+    """qu: ML (si entrenado y switch activo) o Meyerhof. Incluye ponderación λ."""
     if use_ml and (st.session_state.ML_MODEL is not None) and SKLEARN_OK:
         mdl = st.session_state.ML_MODEL
-        # vector de features (incluye D/B)
         X = pd.DataFrame([{
             "gamma": gamma_val, "B": B, "D": D, "phi": phi_val,
             "L_over_B": L_over_B_val, "D_over_B": D / max(B, 1e-9)
         }])
-        # si es residual: qu = qu_meyerhof + res_pred
         if getattr(mdl, "_use_residual", False):
             base = qult_meyerhof(B, D, phi_val, gamma_val)
-            res = float(mdl.predict(X[mdl._feat_cols])[0])
-            return base + res
-        # modo directo (por compatibilidad)
+            res  = float(mdl.predict(X[mdl._feat_cols])[0])
+            lam  = float(st.session_state.lambda_res)
+            return base + lam * res
         cols = mdl._feat_cols if hasattr(mdl, "_feat_cols") else X.columns
         return float(mdl.predict(X[cols])[0])
-    # clásico
     return qult_meyerhof(B, D, phi_val, gamma_val)
 
 # ======================== Servicio & asentamiento ==============
 def contact_pressures(N, B, L, ex=0.0, ey=0.0):
-    """q_serv y q_max con núcleo/área efectiva (sin momentos por defecto)."""
     qavg = N / (B * L)
     in_kern = (abs(ex) <= B / 6) and (abs(ey) <= L / 6)
     if in_kern:
@@ -186,12 +184,10 @@ def contact_pressures(N, B, L, ex=0.0, ey=0.0):
     return qserv, qmax
 
 def settlement_mm(qserv_kpa, B_m, Es_kpa, nu=0.30):
-    """Modelo elástico simple: s ≈ q·B·(1-ν²)/Es → mm."""
     return 1000.0 * (qserv_kpa * B_m * (1 - nu ** 2) / Es_kpa)
 
 # ======================== Costo ================================
 def cost_S(B, L, h, c_conc=650.0, c_acero_kg=5.5, acero_kg_m3=60.0, c_exc=80.0, D=1.5):
-    """Costo simple (S/): concreto + acero + excavación."""
     vol = B * L * h
     acero_kg = acero_kg_m3 * vol
     exc = B * L * D
@@ -230,7 +226,9 @@ if st.button("🚀 Optimizar (FO1 & FO2)"):
 
     # Mensaje modelo usado
     if use_ml and (st.session_state.ML_MODEL is not None) and SKLEARN_OK:
-        st.success(f"Modelo de capacidad usado: **ML (paper)** — RMSE≈ {st.session_state.RMSE_ML:,.2f} kPa")
+        st.success(
+            f"Modelo de capacidad usado: **ML (paper)** — RMSE≈ {st.session_state.RMSE_ML:,.2f} kPa — λ = {st.session_state.lambda_res:.2f}"
+        )
     else:
         st.success("Modelo de capacidad usado: **Meyerhof (clásico)**")
 
