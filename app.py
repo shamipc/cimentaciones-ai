@@ -1,13 +1,14 @@
-# app.py — Optimización de Cimentaciones (mínima) con ML opcional y consideraciones NF/SPT
-# FO1: minimizar costo; FO2: minimizar asentamiento
+# app.py — versión mínima con 2 funciones objetivo (FO1 costo, FO2 asentamiento)
 # Verifica: q_serv ≤ q_adm, q_max ≤ q_adm y s ≤ s_adm
+# ML opcional (paper): si se entrena y activas el switch, predice qu con ML; si no, usa Meyerhof.
+# Muestra métricas de validación: RMSE, MAE, R², nRMSE (sobre mediana) y Sesgo.
 
 import math
 import numpy as np
 import pandas as pd
 import streamlit as st
 
-# ========= ML opcional (importación defensiva) =========
+# ====== ML opcional (con importación defensiva) ======
 try:
     from sklearn.model_selection import train_test_split, GridSearchCV
     from sklearn.ensemble import GradientBoostingRegressor
@@ -20,44 +21,35 @@ except Exception:
 
 st.set_page_config(page_title="Optimización de Cimentaciones — Minimal", layout="centered")
 st.title("Optimización de Cimentaciones (mínima)")
-st.caption("Entradas mínimas + 2 funciones objetivo (FO1 costo, FO2 asentamiento) con verificación de servicio. "
-           "ML opcional para predecir qu (paper-like).")
+st.caption("Entradas mínimas (paper) + 2 funciones objetivo (FO1 costo, FO2 asentamiento) con verificación de servicio.")
 
-# ======================== Entradas ========================
+# ---------------------------------------------------------------------
+# Lista de columnas esperadas por el modelo (orden canónico)
+FEATURE_LIST = ["gamma_eff", "B", "D", "phi", "L_over_B"]
+# ---------------------------------------------------------------------
+
+# ======================== Entradas mínimas ========================
 c1, c2 = st.columns(2)
 with c1:
     N = st.number_input("Carga axial N (kN)", 100.0, 2e5, 800.0, 10.0)
     phi = st.number_input("ϕ (°)", 0.0, 45.0, 32.0, 0.5)
-    gamma_input = st.number_input("γ natural (kN/m³)", 10.0, 24.0, 18.0, 0.1)
+    gamma_eff = st.number_input("γ efectivo en base (kN/m³) → gamma_eff", 10.0, 24.0, 18.0, 0.1)
     Es = st.number_input("Eₛ (kPa) para s (aprox.)", 3000.0, 100000.0, 25000.0, 500.0)
-
 with c2:
     D = st.number_input("Profundidad de base D (m)", 0.5, 6.0, 1.5, 0.1)
     FS = st.number_input("FS (capacidad)", 1.5, 4.0, 2.5, 0.1)
     L_over_B = st.number_input("Relación L/B (constante)", 0.8, 2.0, 1.0, 0.05)
     s_adm_mm = st.number_input("Asentamiento admisible sₐ (mm)", 5.0, 50.0, 25.0, 1.0)
 
-st.markdown("**Condiciones hidrogeotécnicas (opcionales)**")
+st.markdown("**Rangos de búsqueda (B y h)**")
 c3, c4, c5 = st.columns(3)
 with c3:
-    z_NF = st.number_input("Profundidad del nivel freático z_NF (m)  (0 = en terreno)", 0.0, 10.0, 2.0, 0.1)
-with c4:
-    suelo_tipo = st.selectbox("Tipo de suelo predominante", ["Arena (no cohesiva)", "Arcilla (cohesiva)"])
-with c5:
-    N60 = st.number_input("SPT N₆₀ (solo ajusta si es arena; 0 = ignorar)", 0.0, 60.0, 0.0, 1.0)
-
-# γ efectivo en la base (efecto del NF simple)
-gamma_eff = gamma_input if z_NF > D else max(gamma_input - 9.81, 5.0)
-
-st.markdown("**Rangos de búsqueda (B y h)**")
-c6, c7, c8 = st.columns(3)
-with c6:
     Bmin = st.number_input("B min (m)", 0.8, 6.0, 1.0, 0.1)
     Bmax = st.number_input("B max (m)", 0.8, 6.0, 3.0, 0.1)
-with c7:
+with c4:
     hmin = st.number_input("h min (m)", 0.3, 2.0, 0.5, 0.05)
     hmax = st.number_input("h max (m)", 0.3, 2.0, 1.2, 0.05)
-with c8:
+with c5:
     nB = st.number_input("Puntos B", 5, 80, 30, 1)
     nh = st.number_input("Puntos h", 3, 60, 12, 1)
 
@@ -69,40 +61,34 @@ if not SKLEARN_OK:
     st.warning("Para usar ML, agrega `scikit-learn>=1.3,<1.5` en requirements.txt. "
                "Si no, se usará el método clásico (Meyerhof).")
 
-# Estados globales
+# Estados globales mínimos
 if "ML_MODEL" not in st.session_state:
     st.session_state.ML_MODEL = None
 if "RMSE_ML" not in st.session_state:
     st.session_state.RMSE_ML = None
 if "ML_METRICS" not in st.session_state:
     st.session_state.ML_METRICS = {}
+if "FEATURES" not in st.session_state:
+    st.session_state.FEATURES = FEATURE_LIST[:]
 
-up = st.file_uploader("CSV entrenamiento (gamma_eff,B,D,phi,L_over_B,qu)  — también acepta 'gamma' en vez de 'gamma_eff'", type=["csv"])
+# Botón para limpiar estado (evita usar modelos entrenados con columnas distintas)
+if st.button("🔄 Reiniciar/olvidar modelo ML"):
+    for k in ("ML_MODEL", "RMSE_ML", "ML_METRICS", "FEATURES"):
+        st.session_state.pop(k, None)
+    st.session_state.FEATURES = FEATURE_LIST[:]
+    st.success("Modelo/estado ML reiniciado. Vuelve a entrenar con el CSV correcto.")
+
+up = st.file_uploader("CSV entrenamiento (gamma_eff,B,D,phi,L_over_B,qu)", type=["csv"])
 use_ml = st.toggle("Usar modelo ML si está entrenado", value=False)
 
-def _standardize_cols(df: pd.DataFrame) -> pd.DataFrame:
-    dfn = df.copy()
-    dfn.columns = [c.strip().lower() for c in dfn.columns]
-    return dfn
-
 def train_ml(csv):
-    df_raw = pd.read_csv(csv)
-    df = _standardize_cols(df_raw)
+    df = pd.read_csv(csv)
+    req = FEATURE_LIST + ["qu"]
+    miss = [c for c in req if c not in df.columns]
+    if miss:
+        raise ValueError(f"Faltan columnas: {miss}")
 
-    # Acepta gamma_eff o gamma
-    has_gamma_eff = "gamma_eff" in df.columns
-    has_gamma     = "gamma"     in df.columns
-
-    req_base = ["b", "d", "phi", "l_over_b", "qu"]
-    missing = [c for c in req_base if c not in df.columns]
-    if missing:
-        raise ValueError(f"Faltan columnas: {missing}. Presentes: {list(df.columns)}")
-    if not (has_gamma_eff or has_gamma):
-        raise ValueError("Falta 'gamma_eff' o 'gamma' en el CSV de entrenamiento.")
-    if not has_gamma_eff and has_gamma:
-        df["gamma_eff"] = df["gamma"]
-
-    X = df[["gamma_eff", "b", "d", "phi", "l_over_b"]].astype(float)
+    X = df[FEATURE_LIST].astype(float)
     y = df["qu"].astype(float)
 
     Xtr, Xva, ytr, yva = train_test_split(X, y, test_size=0.20, random_state=42)
@@ -118,38 +104,35 @@ def train_ml(csv):
         },
         cv=5,
         scoring="neg_root_mean_squared_error",
-        n_jobs=-1,
+        n_jobs=-1
     )
     grid.fit(Xtr, ytr)
     best = grid.best_estimator_
 
-    # ===== Métricas de validación (compatibles) =====
+    # Guarda el orden real de columnas que el modelo aprendió
+    try:
+        st.session_state.FEATURES = list(best.feature_names_in_)
+    except Exception:
+        st.session_state.FEATURES = FEATURE_LIST[:]
+
+    # ===== Métricas de validación =====
     yhat = best.predict(Xva)
-
-    # RMSE sin usar 'squared=False' (para evitar errores en versiones antiguas)
-    try:
-        mse  = float(mean_squared_error(yva, yhat))
-        rmse = float(np.sqrt(mse))
-    except Exception:
-        rmse = float(np.sqrt(np.mean((yva - yhat) ** 2)))
-
-    try:
-        mae = float(mean_absolute_error(yva, yhat))
-    except Exception:
-        mae = float(np.mean(np.abs(yva - yhat)))
-
+    rmse = float(mean_squared_error(yva, yhat, squared=False))
+    mae  = float(mean_absolute_error(yva, yhat))
     try:
         r2 = float(r2_score(yva, yhat))
     except Exception:
         r2 = float("nan")
-
     med = float(np.median(yva)) if len(yva) else float("nan")
     nrmse_med = float(rmse / med * 100) if np.isfinite(med) and med != 0 else float("nan")
     bias = float(np.mean(yhat - yva))
-
     st.session_state.ML_METRICS = {
-        "rmse": rmse, "mae": mae, "r2": r2,
-        "nrmse_med": nrmse_med, "bias": bias, "n_val": int(len(yva)),
+        "rmse": rmse,
+        "mae": mae,
+        "r2": r2,
+        "nrmse_med": nrmse_med,
+        "bias": bias,
+        "n_val": int(len(yva)),
     }
     return best, rmse
 
@@ -157,7 +140,7 @@ if st.button("Entrenar modelo", use_container_width=True):
     if not SKLEARN_OK:
         st.error("scikit-learn no está disponible en el entorno.")
     elif up is None:
-        st.warning("Sube un CSV válido con columnas: gamma_eff,B,D,phi,L_over_B,qu (o usa 'gamma').")
+        st.warning("Sube un CSV válido con columnas: gamma_eff,B,D,phi,L_over_B,qu.")
     else:
         try:
             model, rmse = train_ml(up)
@@ -167,16 +150,16 @@ if st.button("Entrenar modelo", use_container_width=True):
         except Exception as e:
             st.error(f"Error entrenando: {e}")
 
-# Panel de métricas tras entrenar
+# Panel de métricas visible tras entrenar
 if st.session_state.ML_METRICS:
     m = st.session_state.ML_METRICS
     st.markdown("### Métricas del modelo (validación)")
-    cA, cB, cC, cD, cE = st.columns(5)
-    cA.metric("R²", f"{m['r2']:.3f}" if np.isfinite(m['r2']) else "—")
-    cB.metric("RMSE", f"{m['rmse']:.2f} kPa")
-    cC.metric("MAE", f"{m['mae']:.2f} kPa")
-    cD.metric("nRMSE/Mediana", f"{m['nrmse_med']:.1f}%" if np.isfinite(m['nrmse_med']) else "—")
-    cE.metric("Sesgo", f"{m['bias']:+.2f} kPa")
+    c1m, c2m, c3m, c4m, c5m = st.columns(5)
+    c1m.metric("R²", f"{m['r2']:.3f}" if np.isfinite(m['r2']) else "—")
+    c2m.metric("RMSE", f"{m['rmse']:.2f} kPa")
+    c3m.metric("MAE", f"{m['mae']:.2f} kPa")
+    c4m.metric("nRMSE / Mediana", f"{m['nrmse_med']:.1f}%" if np.isfinite(m['nrmse_med']) else "—")
+    c5m.metric("Sesgo", f"{m['bias']:+.2f} kPa")
     st.caption(f"Conjunto de validación: n = {m['n_val']}")
 
 st.markdown("---")
@@ -192,64 +175,61 @@ def bearing_factors(phi_deg: float):
         Ng = 2.0 * (Nq + 1.0) * math.tan(phi_rad)
     return Nc, Nq, Ng
 
-def qult_meyerhof(B, D, phi, gamma_eff_local):
-    # c≈0 (friccionantes); coef. de forma rectangulares
+def qult_meyerhof(B, D, phi, gamma_eff_val):
+    # c≈0 (arenas/friccionantes); coef. de forma rectangulares
     Nc, Nq, Ng = bearing_factors(phi)
     sc, sq, sg = 1.3, 1.2, 1.0
-    q_eff = gamma_eff_local * D
-    return q_eff * Nq * sq + 0.5 * gamma_eff_local * B * Ng * sg
+    q_eff = gamma_eff_val * D
+    return q_eff * Nq * sq + 0.5 * gamma_eff_val * B * Ng * sg
 
-def spt_factor_arena(N60_val: float) -> float:
-    """Factor suave por SPT en arenas (opcional). 0 → 1.0 (sin ajuste)."""
-    if N60_val <= 0:
-        return 1.0
-    # Escala moderada: 0.6 a 1.6 aprox. (cap en 6–50)
-    return float(np.clip(N60_val / 25.0, 0.6, 1.6))
+def qult_pred(gamma_eff_val, B_val, D_val, phi_val, L_over_B_val):
+    """Predicción de qu: usa ML si está entrenado y el switch activo; si no, Meyerhof."""
+    if use_ml and (st.session_state.get("ML_MODEL") is not None) and SKLEARN_OK:
+        model = st.session_state.ML_MODEL
 
-def qult_pred(gamma_eff_local, B, D, phi_val, L_over_B_val):
-    """Predicción de qu: ML (si está activo) o Meyerhof."""
-    if use_ml and (st.session_state.ML_MODEL is not None) and SKLEARN_OK:
         X = pd.DataFrame([{
-            "gamma_eff": gamma_eff_local, "B": B, "D": D, "phi": phi_val, "L_over_B": L_over_B_val
+            "gamma_eff": gamma_eff_val,
+            "B": B_val,
+            "D": D_val,
+            "phi": phi_val,
+            "L_over_B": L_over_B_val
         }])
-        return float(st.session_state.ML_MODEL.predict(X)[0])
-    # Clásico
-    qu = qult_meyerhof(B, D, phi_val, gamma_eff_local)
-    # Ajuste SPT sólo si tipo de suelo es arena
-    if suelo_tipo.startswith("Arena"):
-        qu *= spt_factor_arena(N60)
-    return qu
 
-# ======================== Servicio y asentamiento ================
-def contact_pressures(NkN, B, L, ex=0.0, ey=0.0):
-    qavg = NkN / (B * L)
-    in_kern = (abs(ex) <= B/6) and (abs(ey) <= L/6)
+        # Ordena columnas como las del modelo (o respaldo FEATURE_LIST)
+        cols = list(getattr(model, "feature_names_in_", st.session_state.get("FEATURES", FEATURE_LIST)))
+        X = X.reindex(columns=cols).astype(float)
+
+        return float(model.predict(X)[0])
+
+    # Clásico Meyerhof
+    return qult_meyerhof(B_val, D_val, phi_val, gamma_eff_val)
+
+# ======================== Servicio y asentamiento =============
+def contact_pressures(N, B, L, ex=0.0, ey=0.0):
+    """q_serv y q_max considerando núcleo/área efectiva (sin momentos por defecto)."""
+    qavg = N / (B * L)
+    in_kern = (abs(ex) <= B / 6) and (abs(ey) <= L / 6)
     if in_kern:
-        qmax = qavg * (1 + 6*abs(ex)/B + 6*abs(ey)/L)
+        qmax = qavg * (1 + 6 * abs(ex) / B + 6 * abs(ey) / L)
         qserv = qavg
     else:
-        Beff, Leff = B - 2*abs(ex), L - 2*abs(ey)
+        Beff, Leff = B - 2 * abs(ex), L - 2 * abs(ey)
         if Beff <= 0 or Leff <= 0:
             return np.inf, np.inf
-        qserv = NkN / (Beff * Leff)
-        qmax  = 2 * NkN / (Beff * Leff)
+        qserv = N / (Beff * Leff)
+        qmax = 2 * N / (Beff * Leff)
     return qserv, qmax
 
-def settlement_mm(qserv_kpa, B_m, Es_kpa, nu=0.30, z_nf=10.0, D_base=1.5):
-    """Modelo elástico simple: s ≈ q·B·(1-ν²)/Es en mm.
-       Penaliza saturación si NF cerca o por debajo de la base."""
-    s = 1000.0 * (qserv_kpa * B_m * (1 - nu**2) / Es_kpa)
-    # Si NF está en la base o por encima (z_NF ≤ D), aumentamos asentamiento (20%)
-    if z_nf <= D_base:
-        s *= 1.20
-    return s
+def settlement_mm(qserv_kpa, B_m, Es_kpa, nu=0.30):
+    """Modelo elástico simple: s ≈ q·B·(1-ν²)/Es → mm."""
+    return 1000.0 * (qserv_kpa * B_m * (1 - nu ** 2) / Es_kpa)
 
 # ======================== Costo ================================
-def cost_S(B, L, h, c_conc=650.0, c_acero_kg=5.5, acero_kg_m3=60.0, c_exc=80.0, D_base=1.5):
+def cost_S(B, L, h, c_conc=650.0, c_acero_kg=5.5, acero_kg_m3=60.0, c_exc=80.0, D=1.5):
     """Costo simple (S/): concreto + acero + excavación."""
     vol = B * L * h
     acero_kg = acero_kg_m3 * vol
-    exc = B * L * D_base
+    exc = B * L * D
     return vol * c_conc + acero_kg * c_acero_kg + exc * c_exc
 
 # ======================== Corrida principal ====================
@@ -263,28 +243,28 @@ if st.button("🚀 Optimizar (FO1 & FO2)"):
         for h in hs:
             qu = qult_pred(gamma_eff, B, D, phi, L_over_B)
             qadm = qu / FS
-            qserv, qmax = contact_pressures(N, B, L)
+            qserv, qmax = contact_pressures(N, B, L)  # sin excentricidad por simplicidad
             if not (qserv <= qadm and qmax <= qadm):
                 continue
-            s = settlement_mm(qserv, B, Es, z_nf=z_NF, D_base=D)
+            s = settlement_mm(qserv, B, Es)
             if s > s_adm_mm:
                 continue
-            costo = cost_S(B, L, h, D_base=D)
+            costo = cost_S(B, L, h, D=D)
             rows.append([B, L, h, qu, qadm, qserv, qmax, s, costo])
 
     if not rows:
         st.error("Sin soluciones factibles con los parámetros dados.")
         st.stop()
 
-    df = pd.DataFrame(rows, columns=["B","L","h","qu","qadm","qserv","qmax","s_mm","costo"])
+    df = pd.DataFrame(rows, columns=["B", "L", "h", "qu", "qadm", "qserv", "qmax", "s_mm", "costo"])
 
     # FO1: costo mínimo
     fo1 = df.loc[df["costo"].idxmin()]
     # FO2: asentamiento mínimo
     fo2 = df.loc[df["s_mm"].idxmin()]
 
-    # Banner del modelo usado
-    if use_ml and (st.session_state.ML_MODEL is not None) and SKLEARN_OK:
+    # ===== Banner del modelo usado =====
+    if use_ml and (st.session_state.get("ML_MODEL") is not None) and SKLEARN_OK:
         if st.session_state.ML_METRICS:
             m = st.session_state.ML_METRICS
             st.success(
@@ -298,6 +278,7 @@ if st.button("🚀 Optimizar (FO1 & FO2)"):
     else:
         st.success("Modelo de capacidad usado: **Meyerhof (clásico)**")
 
+    # ===== Mostrar FO1 y FO2 =====
     cA, cB = st.columns(2)
     with cA:
         st.subheader("FO1 · Mínimo costo")
@@ -306,7 +287,8 @@ if st.button("🚀 Optimizar (FO1 & FO2)"):
         st.subheader("FO2 · Mínimo asentamiento")
         st.table(fo2[["B","L","h","qserv","qadm","qmax","s_mm","costo"]])
 
-    # Recomendación
+    # ===== Recomendación (elige FO1 o FO2) =====
+    # Criterio: si FO2 baja s en ≥5 mm respecto a FO1 y su costo ≤ +5% del FO1, toma FO2; si no, FO1.
     def recomendar(fo1, fo2):
         s1, s2 = fo1.s_mm, fo2.s_mm
         c1, c2 = fo1.costo, fo2.costo
@@ -315,6 +297,7 @@ if st.button("🚀 Optimizar (FO1 & FO2)"):
             return fo2, tag, f"Se elige FO2 por menor asentamiento (−{s1 - s2:.1f} mm) con costo ≤ +5%."
         tag = "FO1 (mínimo costo)"
         return fo1, tag, "Se elige FO1: el ahorro de costo domina y las verificaciones se cumplen."
+
     chosen, tag, why = recomendar(fo1, fo2)
 
     st.markdown("## ✅ Recomendación")
