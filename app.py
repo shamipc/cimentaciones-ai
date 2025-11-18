@@ -7,21 +7,26 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-# ========= ML (paper-like) con importación defensiva =========
-try:
-    from sklearn.model_selection import train_test_split, GridSearchCV
-    from sklearn.ensemble import GradientBoostingRegressor
-    SKLEARN_OK = True
-except Exception:
-    SKLEARN_OK = False
-    train_test_split = GridSearchCV = GradientBoostingRegressor = None
-
 st.set_page_config(page_title="Optimización de Cimentaciones — Minimal", layout="centered")
 st.title("Optimización de Cimentaciones (mínima)")
 st.caption(
     "Entradas mínimas (paper) + 2 funciones objetivo: **FO1 costo** y **FO2 utilización (q_serv/q_adm)** "
     "con verificación de servicio."
 )
+
+# ========= Diagnóstico e importación de ML (paper) =========
+SKLEARN_OK = False
+train_test_split = GridSearchCV = GradientBoostingRegressor = None
+try:
+    import sklearn  # sólo para saber versión
+    _skver = sklearn.__version__
+    st.info(f"✅ scikit-learn cargado: versión {_skver}")
+    from sklearn.model_selection import train_test_split, GridSearchCV
+    from sklearn.ensemble import GradientBoostingRegressor
+    SKLEARN_OK = True
+except Exception as _e:
+    st.warning(f"⚠️ scikit-learn NO cargó. Motivo: {type(_e).__name__}: {_e}")
+    st.caption("Se usará el método clásico (Meyerhof). Para activar ML, revisa tu requirements.txt.")
 
 # ======================== Entradas mínimas ========================
 c1, c2 = st.columns(2)
@@ -52,11 +57,6 @@ st.markdown("---")
 
 # ======================== ML opcional (paper) ========================
 st.subheader("ML opcional (paper)")
-if not SKLEARN_OK:
-    st.warning(
-        "Para usar ML, agrega `scikit-learn>=1.3,<1.5` en requirements.txt. "
-        "Si no, se usará el método clásico (Meyerhof)."
-    )
 use_ml = False
 ML_MODEL = None
 RMSE = None
@@ -110,7 +110,7 @@ def qult_meyerhof(B, D, phi, gamma):
     Nc, Nq, Ng = bearing_factors(phi)
     sc, sq, sg = 1.3, 1.2, 1.0  # rectangular
     q_eff = gamma * D
-    # c≈0 (friccional). Si necesitas cohesión: + c*Nc*sc
+    # c≈0 (friccional). Si hay cohesión: + c*Nc*sc
     return q_eff * Nq * sq + 0.5 * gamma * B * Ng * sg
 
 def qult_pred(gamma, B, D, phi, L_over_B):
@@ -123,7 +123,7 @@ def qult_pred(gamma, B, D, phi, L_over_B):
     return qult_meyerhof(B, D, phi, gamma)
 
 def qult_ml_only(gamma, B, D, phi, L_over_B):
-    """Sólo ML (para comparar); devuelve None si no hay ML entrenado/activo."""
+    """Sólo ML (para comparar); None si no hay ML entrenado/activo."""
     if use_ml and (ML_MODEL is not None) and SKLEARN_OK:
         X = pd.DataFrame(
             [{"gamma": float(gamma), "B": float(B), "D": float(D), "phi": float(phi), "L_over_B": float(L_over_B)}]
