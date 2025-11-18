@@ -1,6 +1,7 @@
 # app.py — versión mínima con 2 funciones objetivo (FO1 costo, FO2 asentamiento)
 # Verifica: q_serv ≤ q_adm, q_max ≤ q_adm y s ≤ s_adm
 # ML opcional (paper): si se entrena y activas el switch, predice qu con ML; si no, usa Meyerhof.
+# Ahora incluye métricas: RMSE (kPa), MAE (kPa), R², nRMSE (% mediana y % rango) y sesgo.
 
 import math
 import numpy as np
@@ -10,11 +11,13 @@ import streamlit as st
 # ====== ML opcional (con importación defensiva) ======
 try:
     from sklearn.model_selection import train_test_split, GridSearchCV
-    from sklearn.ensemble import GradientBoostingRegressor
+    from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
+    from sklearn.metrics import mean_absolute_error, r2_score
     SKLEARN_OK = True
 except Exception:
     SKLEARN_OK = False
-    train_test_split = GridSearchCV = GradientBoostingRegressor = None
+    train_test_split = GridSearchCV = GradientBoostingRegressor = RandomForestRegressor = None
+    mean_absolute_error = r2_score = None
 
 st.set_page_config(page_title="Optimización de Cimentaciones — Minimal", layout="centered")
 st.title("Optimización de Cimentaciones (mínima)")
@@ -56,42 +59,68 @@ if not SKLEARN_OK:
 # Estados globales mínimos
 if "ML_MODEL" not in st.session_state:
     st.session_state.ML_MODEL = None
-if "RMSE_ML" not in st.session_state:
-    st.session_state.RMSE_ML = None
+if "ML_METRICS" not in st.session_state:
+    st.session_state.ML_METRICS = None
 
 up = st.file_uploader("CSV entrenamiento (gamma,B,D,phi,L_over_B,qu)", type=["csv"])
 use_ml = st.toggle("Usar modelo ML si está entrenado", value=False)
+model_choice = st.selectbox("Modelo ML", ["GradientBoosting", "RandomForest"])
 
-def train_ml(csv):
+def train_ml(csv, kind="GradientBoosting"):
     df = pd.read_csv(csv)
     req = ["gamma", "B", "D", "phi", "L_over_B", "qu"]
     miss = [c for c in req if c not in df.columns]
     if miss:
         raise ValueError(f"Faltan columnas: {miss}")
 
-    X = df[["gamma", "B", "D", "phi", "L_over_B"]]
+    X = df[["gamma", "B", "D", "phi", "L_over_B"]].astype(float)
     y = df["qu"].astype(float)
 
     Xtr, Xva, ytr, yva = train_test_split(X, y, test_size=0.20, random_state=42)
 
-    gbr = GradientBoostingRegressor(random_state=42)
-    grid = GridSearchCV(
-        gbr,
-        {"n_estimators": [150, 300, 500],
-         "max_depth": [2, 3],
-         "learning_rate": [0.05, 0.1],
-         "min_samples_leaf": [3, 5]},
-        cv=5,
-        scoring="neg_root_mean_squared_error",
-        n_jobs=-1
-    )
+    if kind == "RandomForest":
+        base = RandomForestRegressor(random_state=42)
+        grid = GridSearchCV(
+            base,
+            {"n_estimators": [200, 400, 800],
+             "max_depth": [None, 8, 12],
+             "min_samples_leaf": [1, 2, 4]},
+            cv=5,
+            scoring="neg_root_mean_squared_error",
+            n_jobs=-1
+        )
+    else:
+        base = GradientBoostingRegressor(random_state=42)
+        grid = GridSearchCV(
+            base,
+            {"n_estimators": [150, 300, 500],
+             "max_depth": [2, 3],
+             "learning_rate": [0.05, 0.1],
+             "min_samples_leaf": [3, 5]},
+            cv=5,
+            scoring="neg_root_mean_squared_error",
+            n_jobs=-1
+        )
+
     grid.fit(Xtr, ytr)
     best = grid.best_estimator_
 
-    # RMSE en validación
+    # Métricas en validación
     yhat = best.predict(Xva)
-    rmse = float(np.sqrt(np.mean((yva - yhat) ** 2)))
-    return best, rmse
+    rmse = float(np.sqrt(np.mean((yva - yhat)**2)))
+    mae  = float(mean_absolute_error(yva, yhat))
+    r2   = float(r2_score(yva, yhat))
+    med  = float(np.median(yva))
+    rng  = float(np.max(yva) - np.min(yva)) or 1.0
+    nrmse_med = 100.0 * rmse / med
+    nrmse_rng = 100.0 * rmse / rng
+    bias = float(np.mean(yva - yhat))  # + subestima; - sobrestima
+
+    metrics = {"rmse": rmse, "mae": mae, "r2": r2,
+               "nrmse_med": nrmse_med, "nrmse_rng": nrmse_rng,
+               "bias": bias, "kind": kind}
+    diag = pd.DataFrame({"y_true": yva.values, "y_pred": yhat})
+    return best, metrics, diag
 
 if st.button("Entrenar modelo", use_container_width=True):
     if not SKLEARN_OK:
@@ -100,14 +129,25 @@ if st.button("Entrenar modelo", use_container_width=True):
         st.warning("Sube un CSV válido con columnas: gamma,B,D,phi,L_over_B,qu.")
     else:
         try:
-            model, rmse = train_ml(up)
+            model, metrics, diag = train_ml(up, model_choice)
             st.session_state.ML_MODEL = model
-            st.session_state.RMSE_ML = rmse
-            st.success(f"Modelo entrenado. RMSE≈ {rmse:,.2f} kPa")
+            st.session_state.ML_METRICS = metrics
+            st.success(
+                f"Modelo entrenado ({metrics['kind']}). "
+                f"RMSE≈ {metrics['rmse']:,.2f} kPa | "
+                f"MAE≈ {metrics['mae']:,.2f} kPa | "
+                f"R²≈ {metrics['r2']:.3f} | "
+                f"nRMSE≈ {metrics['nrmse_med']:.1f}% de la mediana "
+                f"(o {metrics['nrmse_rng']:.1f}% del rango) | "
+                f"Sesgo≈ {metrics['bias']:+.2f} kPa"
+            )
+            with st.expander("Diagnóstico del ajuste (validación)"):
+                st.write("Primeras filas y/ŷ (ideal: línea 1:1).")
+                st.dataframe(diag.head(30), use_container_width=True)
         except Exception as e:
             st.error(f"Error entrenando: {e}")
 
-# ======================== Capacidad última ========================
+# ======================== Capacidad última (clásico) ========================
 def bearing_factors(phi_deg: float):
     phi_rad = math.radians(phi_deg)
     if phi_rad < 1e-6:
@@ -132,10 +172,9 @@ def qult_pred(gamma_val, B, D, phi_val, L_over_B_val):
             "gamma": gamma_val, "B": B, "D": D, "phi": phi_val, "L_over_B": L_over_B_val
         }])
         return float(st.session_state.ML_MODEL.predict(X)[0])
-    # Clásico
     return qult_meyerhof(B, D, phi_val, gamma_val)
 
-# ======================== Servicio y asentamiento =============
+# ======================== Servicio y asentamiento =========================
 def contact_pressures(N, B, L, ex=0.0, ey=0.0):
     """q_serv y q_max considerando núcleo/área efectiva (sin momentos por defecto)."""
     qavg = N / (B * L)
@@ -163,7 +202,7 @@ def cost_S(B, L, h, c_conc=650.0, c_acero_kg=5.5, acero_kg_m3=60.0, c_exc=80.0, 
     exc = B * L * D
     return vol * c_conc + acero_kg * c_acero_kg + exc * c_exc
 
-# ======================== Corrida principal ====================
+# ======================== Optimización principal ====================
 if st.button("🚀 Optimizar (FO1 & FO2)"):
     Bs = np.linspace(Bmin, Bmax, int(nB))
     hs = np.linspace(hmin, hmax, int(nh))
@@ -196,7 +235,13 @@ if st.button("🚀 Optimizar (FO1 & FO2)"):
 
     # ===== Banner del modelo usado =====
     if use_ml and (st.session_state.ML_MODEL is not None) and SKLEARN_OK:
-        st.success(f"Modelo de capacidad usado: **ML (paper)** — RMSE≈ {st.session_state.RMSE_ML:,.2f} kPa")
+        m = st.session_state.ML_METRICS or {}
+        st.success(
+            "Modelo de capacidad usado: **ML (paper)** — "
+            f"RMSE≈ {m.get('rmse', float('nan')):,.2f} kPa, "
+            f"MAE≈ {m.get('mae', float('nan')):,.2f} kPa, "
+            f"R²≈ {m.get('r2', float('nan')):.3f}"
+        )
     else:
         st.success("Modelo de capacidad usado: **Meyerhof (clásico)**")
 
