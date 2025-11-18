@@ -1,5 +1,6 @@
 # app.py — 2 funciones objetivo: costo (FO1) y asentamiento (FO2)
 # Verificaciones: q_serv ≤ q_adm, q_max ≤ q_adm y s ≤ s_adm
+# Incluye ML opcional (paper) con persistencia en session_state
 
 import math
 import numpy as np
@@ -10,16 +11,22 @@ st.set_page_config(page_title="Optimización de Cimentaciones — Minimal", layo
 st.title("Optimización de Cimentaciones (mínima)")
 st.caption("FO1: minimizar costo · FO2: minimizar asentamiento · con verificación de servicio.")
 
+# ===================== Estado persistente =====================
+if "ml_model" not in st.session_state:
+    st.session_state.ml_model = None
+if "ml_rmse" not in st.session_state:
+    st.session_state.ml_rmse = None
+if "use_ml_flag" not in st.session_state:
+    st.session_state.use_ml_flag = False
+
 # ========= Diagnóstico e importación de ML (paper) =========
 SKLEARN_OK = False
-train_test_split = GridSearchCV = GradientBoostingRegressor = None
 try:
     import sklearn
-    _skver = sklearn.__version__
-    st.info(f"✅ scikit-learn cargado: versión {_skver}")
     from sklearn.model_selection import train_test_split, GridSearchCV
     from sklearn.ensemble import GradientBoostingRegressor
     SKLEARN_OK = True
+    st.info(f"✅ scikit-learn cargado: versión {sklearn.__version__}")
 except Exception as _e:
     st.warning(f"⚠️ scikit-learn NO cargó. Motivo: {type(_e).__name__}: {_e}")
     st.caption("Se usará el método clásico (Meyerhof). Para activar ML, revisa tu requirements.txt.")
@@ -53,16 +60,17 @@ st.markdown("---")
 
 # ======================== ML opcional (paper) ========================
 st.subheader("ML opcional (paper)")
-use_ml = False
-ML_MODEL = None
-RMSE = None
-
 if SKLEARN_OK:
     up = st.file_uploader("CSV entrenamiento (gamma,B,D,phi,L_over_B,qu)", type=["csv"])
-    use_ml = st.toggle("Usar modelo ML si está entrenado", value=False)
 
-    def train_ml(csv):
-        df = pd.read_csv(csv)
+    # toggle persistente
+    st.session_state.use_ml_flag = st.toggle(
+        "Usar modelo ML si está entrenado",
+        value=st.session_state.use_ml_flag
+    )
+
+    def train_ml(csv_file):
+        df = pd.read_csv(csv_file)
         req = ["gamma", "B", "D", "phi", "L_over_B", "qu"]
         miss = [c for c in req if c not in df.columns]
         if miss:
@@ -85,10 +93,15 @@ if SKLEARN_OK:
             st.warning("Sube un CSV válido con columnas: gamma,B,D,phi,L_over_B,qu.")
         else:
             try:
-                ML_MODEL, RMSE = train_ml(up)
-                st.success(f"Modelo entrenado. RMSE≈ {RMSE:,.2f} kPa")
+                model, rmse = train_ml(up)
+                st.session_state.ml_model = model
+                st.session_state.ml_rmse = rmse
+                st.session_state.use_ml_flag = True  # activar automáticamente tras entrenar
+                st.success(f"Modelo entrenado. RMSE≈ {rmse:,.2f} kPa (ML activado)")
             except Exception as e:
                 st.error(f"Error entrenando: {e}")
+else:
+    st.caption("Para usar ML, instala scikit-learn (ver requirements.txt).")
 
 # ======================== Capacidad última (q_u) ====================
 def bearing_factors(phi_deg: float):
@@ -105,15 +118,19 @@ def qult_meyerhof(B, D, phi, gamma):
     Nc, Nq, Ng = bearing_factors(phi)
     sc, sq, sg = 1.3, 1.2, 1.0  # rectangular
     q_eff = gamma * D
-    # c≈0 (friccional). Si hay cohesión: + c*Nc*sc
+    # c≈0 (friccional). Si hay cohesión: qu += c*Nc*sc
     return q_eff * Nq * sq + 0.5 * gamma * B * Ng * sg
 
 def qult_pred(gamma, B, D, phi, L_over_B):
-    if use_ml and (ML_MODEL is not None) and SKLEARN_OK:
-        X = pd.DataFrame(
-            [{"gamma": float(gamma), "B": float(B), "D": float(D), "phi": float(phi), "L_over_B": float(L_over_B)}]
-        )
-        return float(ML_MODEL.predict(X)[0])
+    """Predice q_u con ML si está activo; si no, usa Meyerhof."""
+    if (SKLEARN_OK
+        and st.session_state.use_ml_flag
+        and st.session_state.ml_model is not None):
+        X = pd.DataFrame([{
+            "gamma": float(gamma), "B": float(B), "D": float(D),
+            "phi": float(phi), "L_over_B": float(L_over_B)
+        }])
+        return float(st.session_state.ml_model.predict(X)[0])
     return qult_meyerhof(B, D, phi, gamma)
 
 # ======================== Servicio y asentamiento =============
@@ -145,6 +162,15 @@ def cost_S(B, L, h, c_conc=650.0, c_acero_kg=5.5, acero_kg_m3=60.0, c_exc=80.0, 
 
 # ======================== Corrida principal ====================
 if st.button("🚀 Optimizar (FO1 & FO2)"):
+    # Banner del modelo usado
+    st.success(
+        "Modelo de capacidad usado: "
+        + ("**ML** (paper)" + (f" — RMSE≈ {st.session_state.ml_rmse:,.2f} kPa"
+           if st.session_state.ml_rmse else "")
+           if (SKLEARN_OK and st.session_state.use_ml_flag and st.session_state.ml_model is not None)
+           else "**Meyerhof** (clásico)")
+    )
+
     Bs = np.linspace(Bmin, Bmax, int(nB))
     hs = np.linspace(hmin, hmax, int(nh))
 
@@ -173,10 +199,10 @@ if st.button("🚀 Optimizar (FO1 & FO2)"):
     # -------- FO1: mínimo costo --------
     fo1 = df.loc[df["costo"].idxmin()]
 
-    # -------- FO2: mínimo asentamiento --------
+    # -------- FO2: mínimo asentamiento (desempate por costo) --------
     fo2 = df.sort_values(["s_mm", "costo"]).iloc[0]
 
-    # ===== Regla de decisión (elegir FO2 si realmente compensa) =====
+    # ===== Regla de decisión =====
     def decidir(fo1, fo2):
         c1, c2 = float(fo1.costo), float(fo2.costo)
         s1, s2 = float(fo1.s_mm), float(fo2.s_mm)
@@ -191,13 +217,6 @@ if st.button("🚀 Optimizar (FO1 & FO2)"):
         return fo1, "FO1 (mínimo costo)", "Se elige **FO1**: el ahorro de costo domina; la mejora de s no justifica el sobrecosto."
 
     chosen, tag, why = decidir(fo1, fo2)
-
-    # Mensaje del modelo usado
-    st.success(
-        "Modelo de capacidad usado: "
-        + ("**ML** (paper)" + (f" — RMSE≈ {RMSE:,.2f} kPa" if RMSE else "")
-           if (SKLEARN_OK and use_ml and (ML_MODEL is not None)) else "**Meyerhof** (clásico)")
-    )
 
     cA, cB = st.columns(2)
     with cA:
