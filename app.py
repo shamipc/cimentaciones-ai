@@ -2,7 +2,7 @@
 # app.py — Optimización de Cimentaciones con ML (qu + asentamiento)
 # Versión: asentamiento igual al paper (SPT, B, Df/B, q) + mejoras de predicción
 # Sin q_max (carga centrada → presión uniforme)
-# + Gráficas Measured vs Calculated (ML vs métodos clásicos) con Streamlit
+# + Gráficas Measured vs Calculated (ML) con Streamlit
 # ===============================================================
 
 import math
@@ -311,24 +311,16 @@ if st.button("🚀 Optimizar"):
             if s > s_adm_mm:
                 continue
 
-           # ===================== Costo simple =====================
+            # Costo simple (valores aproximados basados en Revista Costos)
             vol = B * L * h
-
-            # Valores de ejemplo tipo Revista Costos / CAPECO
-            # (ajusta estos números con los datos reales que tengas)
-            c_conc = 420.0       # S/ por m³ de concreto
-            acero_kg_m3 = 75.0   # kg de acero por m³
-            c_acero_kg = 7.0     # S/ por kg de acero
-            c_exc = 95.0         # S/ por m³ de excavación
-
             costo = (
-                vol * c_conc +                 # concreto
-                vol * acero_kg_m3 * c_acero_kg +  # acero
-                (B * L * D) * c_exc            # excavación
+                vol * 379 +          # concreto ≈ S/ 379 / m³
+                vol * 60 * 5.5 +     # acero (60 kg/m³, ≈ S/ 5.5 / kg)
+                (B * L * D) * 80     # excavación ≈ S/ 80 / m³
             )
-            # =======================================================
 
             rows.append([B, L, h, qu, qadm, qserv, s, costo])
+
     if not rows:
         st.error("No se encontraron soluciones factibles.")
         st.stop()
@@ -376,87 +368,4 @@ if st.button("🚀 Optimizar"):
     st.markdown(f"""
     ## ✅ Recomendación de Diseño  
 
-    **Solución seleccionada:** {tag}  
-
-    - B = **{chosen.B:.2f} m**  
-    - L = **{chosen.L:.2f} m**  
-    - h = **{chosen.h:.2f} m**  
-    - q_serv = **{chosen.qserv:.1f} kPa** ≤ q_adm = **{chosen.qadm:.1f} kPa**  
-    - Asentamiento estimado = **{chosen.s_mm:.2f} mm** ≤ {s_adm_mm:.1f} mm  
-    - Costo aproximado ≈ **S/ {chosen.costo:,.2f}**  
-
-    **Criterio de elección entre FO1 y FO2:**  
-    {why}
-    """)
-
-    st.download_button(
-        "Descargar soluciones (CSV)",
-        df.to_csv(index=False),
-        "soluciones.csv",
-        "text/csv"
-    )
-
-# ========================================================================
-# ==================== GRÁFICAS MEASURED vs CALCULATED ===================
-# ========================================================================
-st.markdown("---")
-st.header("Análisis gráfico del desempeño de los modelos ML")
-
-col_qu, col_s = st.columns(2)
-
-# ---------- Gráficas para q_ult ----------
-with col_qu:
-    st.subheader("q₍ult₎ · Measured vs Calculated")
-
-    if st.session_state.ML_MODEL is None or st.session_state.DF_QU is None:
-        st.info("Entrena primero el modelo de q₍ult₎ para ver estas gráficas.")
-    else:
-        df_qu = st.session_state.DF_QU.copy()
-        X_qu = df_qu[["gamma", "B", "D", "phi", "L_over_B"]]
-        y_qu = df_qu["qu"].astype(float)
-
-        # Predicción ML
-        y_pred_ml = st.session_state.ML_MODEL.predict(X_qu)
-
-        # Predicción Meyerhof clásica
-        qu_meyer = [
-            qult_meyerhof(B, D, phi, gamma)
-            for B, D, phi, gamma in zip(df_qu["B"], df_qu["D"], df_qu["phi"], df_qu["gamma"])
-        ]
-
-        st.caption("Modelo ML (Gradient Boosting)")
-        df_plot_ml = pd.DataFrame({
-            "Measured_qu": y_qu,
-            "Calculated_qu_ML": y_pred_ml
-        })
-        st.scatter_chart(df_plot_ml, x="Measured_qu", y="Calculated_qu_ML")
-
-        st.caption("Meyerhof clásico")
-        df_plot_m = pd.DataFrame({
-            "Measured_qu": y_qu,
-            "Calculated_qu_Meyerhof": qu_meyer
-        })
-        st.scatter_chart(df_plot_m, x="Measured_qu", y="Calculated_qu_Meyerhof")
-
-# ---------- Gráfica para asentamiento ----------
-with col_s:
-    st.subheader("Asentamiento · Measured vs Calculated")
-
-    if st.session_state.ML_S_MODEL is None or st.session_state.DF_S is None:
-        st.info("Entrena primero el modelo de asentamiento para ver esta gráfica.")
-    else:
-        df_s = st.session_state.DF_S.copy()
-        X_s = df_s[["SPT", "B", "Df_over_B", "q"]]
-        y_s = df_s["s_mm"].astype(float)
-
-        # Predicción ML (recordar que entrenamos en log, pero aquí queremos s_mm)
-        y_log_pred = st.session_state.ML_S_MODEL.predict(X_s)
-        y_pred_s = np.expm1(y_log_pred)
-
-        df_plot_s = pd.DataFrame({
-            "Measured_s": y_s,
-            "Calculated_s_ML": y_pred_s
-        })
-        st.scatter_chart(df_plot_s, x="Measured_s", y="Calculated_s_ML")
-
-
+    **Soluci**
