@@ -2,14 +2,13 @@
 # app.py — Optimización de Cimentaciones con ML (qu + asentamiento)
 # Versión: asentamiento igual al paper (SPT, B, Df/B, q) + mejoras de predicción
 # Sin q_max (carga centrada → presión uniforme)
-# + Gráficas Measured vs Calculated (ML vs métodos clásicos)
+# + Gráficas Measured vs Calculated (ML vs métodos clásicos) con Streamlit
 # ===============================================================
 
 import math
 import numpy as np
 import pandas as pd
 import streamlit as st
-import matplotlib.pyplot as plt
 
 # ============================= ML defensivo =============================
 try:
@@ -397,11 +396,12 @@ st.header("Análisis gráfico del desempeño de los modelos ML")
 
 col_qu, col_s = st.columns(2)
 
-# ---------- Gráfica para q_ult ----------
+# ---------- Gráficas para q_ult ----------
 with col_qu:
-    st.subheader("q₍ult₎ · ML vs Meyerhof")
+    st.subheader("q₍ult₎ · Measured vs Calculated")
+
     if st.session_state.ML_MODEL is None or st.session_state.DF_QU is None:
-        st.info("Entrena primero el modelo de q₍ult₎ para ver esta gráfica.")
+        st.info("Entrena primero el modelo de q₍ult₎ para ver estas gráficas.")
     else:
         df_qu = st.session_state.DF_QU.copy()
         X_qu = df_qu[["gamma", "B", "D", "phi", "L_over_B"]]
@@ -416,29 +416,24 @@ with col_qu:
             for B, D, phi, gamma in zip(df_qu["B"], df_qu["D"], df_qu["phi"], df_qu["gamma"])
         ]
 
-        # Límite para línea y=x
-        all_vals = np.concatenate([y_qu.values, np.array(y_pred_ml), np.array(qu_meyer)])
-        vmin = float(all_vals.min())
-        vmax = float(all_vals.max())
-        margin = 0.05 * (vmax - vmin)
-        vmin -= margin
-        vmax += margin
+        st.caption("Modelo ML (Gradient Boosting)")
+        df_plot_ml = pd.DataFrame({
+            "Measured_qu": y_qu,
+            "Calculated_qu_ML": y_pred_ml
+        })
+        st.scatter_chart(df_plot_ml, x="Measured_qu", y="Calculated_qu_ML")
 
-        fig1, ax1 = plt.subplots()
-        ax1.plot(y_qu, y_pred_ml, "o", label="ML (Gradient Boosting)")
-        ax1.plot(y_qu, qu_meyer, "+", label="Meyerhof")
-        ax1.plot([vmin, vmax], [vmin, vmax], "--", label="y = x (predicción perfecta)")
-        ax1.set_xlabel("q₍ult₎ medido (kPa)")
-        ax1.set_ylabel("q₍ult₎ calculado (kPa)")
-        ax1.set_xlim(vmin, vmax)
-        ax1.set_ylim(vmin, vmax)
-        ax1.legend()
-        ax1.grid(True, alpha=0.3)
-        st.pyplot(fig1)
+        st.caption("Meyerhof clásico")
+        df_plot_m = pd.DataFrame({
+            "Measured_qu": y_qu,
+            "Calculated_qu_Meyerhof": qu_meyer
+        })
+        st.scatter_chart(df_plot_m, x="Measured_qu", y="Calculated_qu_Meyerhof")
 
 # ---------- Gráfica para asentamiento ----------
 with col_s:
-    st.subheader("Asentamiento · ML vs medido")
+    st.subheader("Asentamiento · Measured vs Calculated")
+
     if st.session_state.ML_S_MODEL is None or st.session_state.DF_S is None:
         st.info("Entrena primero el modelo de asentamiento para ver esta gráfica.")
     else:
@@ -450,21 +445,9 @@ with col_s:
         y_log_pred = st.session_state.ML_S_MODEL.predict(X_s)
         y_pred_s = np.expm1(y_log_pred)
 
-        all_vals_s = np.concatenate([y_s.values, np.array(y_pred_s)])
-        vmin_s = float(all_vals_s.min())
-        vmax_s = float(all_vals_s.max())
-        margin_s = 0.05 * (vmax_s - vmin_s)
-        vmin_s -= margin_s
-        vmax_s += margin_s
-
-        fig2, ax2 = plt.subplots()
-        ax2.plot(y_s, y_pred_s, "o", label="ML asentamiento")
-        ax2.plot([vmin_s, vmax_s], [vmin_s, vmax_s], "--", label="y = x (predicción perfecta)")
-        ax2.set_xlabel("Asentamiento medido (mm)")
-        ax2.set_ylabel("Asentamiento calculado (mm)")
-        ax2.set_xlim(vmin_s, vmax_s)
-        ax2.set_ylim(vmin_s, vmax_s)
-        ax2.legend()
-        ax2.grid(True, alpha=0.3)
-        st.pyplot(fig2)
+        df_plot_s = pd.DataFrame({
+            "Measured_s": y_s,
+            "Calculated_s_ML": y_pred_s
+        })
+        st.scatter_chart(df_plot_s, x="Measured_s", y="Calculated_s_ML")
 
