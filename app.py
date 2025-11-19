@@ -1,5 +1,5 @@
 # ===============================================================
-# app.py — Optimización de Cimentaciones con ML (qu y asentamiento)
+# app.py — Optimización de Cimentaciones con ML (qu + asentamiento)
 # ===============================================================
 
 import math
@@ -9,16 +9,17 @@ import streamlit as st
 
 # ============================= ML defensivo =============================
 try:
-    from sklearn.model_selection import train_test_split, GridSearchCV
-    from sklearn.ensemble import GradientBoostingRegressor
+    from sklearn.model_selection import train_test_split, GridSearchCV, KFold
+    from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.pipeline import Pipeline
     SKLEARN_OK = True
 except Exception:
     SKLEARN_OK = False
-    train_test_split = GridSearchCV = GradientBoostingRegressor = None
 
 st.set_page_config(page_title="Optimización de Cimentaciones con ML", layout="centered")
-st.title("Optimización de Cimentaciones (qu + asentamiento con ML)")
-st.caption("Incluye predicción ML para capacidad última y asentamiento según paper 2024.")
+st.title("Optimización de Cimentaciones con ML (qu + asentamiento)")
+st.caption("Incluye predicción ML optimizada para capacidad última y asentamiento (paper 2024).")
 
 # ========================================================================
 # ESTADOS GLOBALES
@@ -67,7 +68,7 @@ with c5:
 # ========================================================================
 # =========================== ML PARA q_ULTIMO ===========================
 # ========================================================================
-st.subheader("Modelo ML para q₍ult₎")
+st.subheader("Modelo ML optimizado para q₍ult₎")
 
 up = st.file_uploader("CSV para ML de capacidad última (gamma,B,D,phi,L_over_B,qu)", type=["csv"])
 use_ml = st.toggle("Usar ML para q₍ult₎", value=False)
@@ -82,13 +83,34 @@ def train_ml_qu(csv):
     X = df[["gamma", "B", "D", "phi", "L_over_B"]]
     y = df["qu"].astype(float)
 
-    Xtr, Xva, ytr, yva = train_test_split(X, y, test_size=0.20, random_state=42)
+    pipe = Pipeline([
+        ("scaler", StandardScaler()),
+        ("model", GradientBoostingRegressor())
+    ])
 
-    model = GradientBoostingRegressor(random_state=42)
-    model.fit(Xtr, ytr)
+    param_grid = {
+        "model__n_estimators": [300, 500, 800],
+        "model__max_depth": [2, 3, 4],
+        "model__learning_rate": [0.03, 0.05, 0.1],
+        "model__min_samples_leaf": [3, 5, 8],
+    }
 
-    r2 = model.score(Xva, yva)  # <<<<<< R² en lugar de RMSE
-    return model, r2
+    cv = KFold(n_splits=5, shuffle=True, random_state=42)
+
+    grid = GridSearchCV(
+        estimator=pipe,
+        param_grid=param_grid,
+        cv=cv,
+        n_jobs=-1,
+        scoring="r2"
+    )
+
+    grid.fit(X, y)
+
+    best_model = grid.best_estimator_
+    r2_final = grid.best_score_
+
+    return best_model, r2_final
 
 if st.button("Entrenar modelo q₍ult₎"):
     if not SKLEARN_OK:
@@ -124,13 +146,34 @@ def train_ml_settlement(csv):
     X = df[["SPT", "B", "Df_over_B", "q"]]
     y = df["s_mm"].astype(float)
 
-    Xtr, Xva, ytr, yva = train_test_split(X, y, test_size=0.20, random_state=42)
+    pipe = Pipeline([
+        ("scaler", StandardScaler()),
+        ("model", GradientBoostingRegressor())
+    ])
 
-    model = GradientBoostingRegressor(random_state=42)
-    model.fit(Xtr, ytr)
+    param_grid = {
+        "model__n_estimators": [300, 500, 800],
+        "model__max_depth": [2, 3, 4],
+        "model__learning_rate": [0.03, 0.05, 0.1],
+        "model__min_samples_leaf": [3, 5, 8],
+    }
 
-    r2 = model.score(Xva, yva)   # <<<<<< como el paper
-    return model, r2
+    cv = KFold(n_splits=5, shuffle=True, random_state=42)
+
+    grid = GridSearchCV(
+        estimator=pipe,
+        param_grid=param_grid,
+        cv=cv,
+        n_jobs=-1,
+        scoring="r2"
+    )
+
+    grid.fit(X, y)
+
+    best = grid.best_estimator_
+    r2 = grid.best_score_
+
+    return best, r2
 
 if st.button("Entrenar modelo de asentamiento"):
     if not SKLEARN_OK:
@@ -161,12 +204,11 @@ def bearing_factors(phi_deg):
 
 def qult_meyerhof(B, D, phi, gamma):
     Nc, Nq, Ng = bearing_factors(phi)
-    sc, sq, sg = 1.3, 1.2, 1.0
     q_eff = gamma * D
-    return q_eff * Nq * sq + 0.5 * gamma * B * Ng * sg
+    return q_eff * Nq + 0.5 * gamma * B * Ng
 
 def qult_pred(gamma_val, B, D, phi_val, L_over_B_val):
-    if use_ml and (st.session_state.ML_MODEL is not None) and SKLEARN_OK:
+    if use_ml and st.session_state.ML_MODEL is not None:
         X = pd.DataFrame([{
             "gamma": gamma_val,
             "B": B,
@@ -181,7 +223,7 @@ def settlement_elastic(qserv_kpa, B_m, Es_kpa, nu=0.30):
     return 1000 * (qserv_kpa * B_m * (1 - nu**2) / Es_kpa)
 
 def settlement_pred(SPT, B, D, qserv):
-    if use_ml_s and (st.session_state.ML_S_MODEL is not None) and SKLEARN_OK:
+    if use_ml_s and st.session_state.ML_S_MODEL is not None:
         X = pd.DataFrame([{
             "SPT": SPT,
             "B": B,
@@ -191,12 +233,9 @@ def settlement_pred(SPT, B, D, qserv):
         return float(st.session_state.ML_S_MODEL.predict(X)[0])
     return settlement_elastic(qserv, B, Es)
 
-# ========================================================================
-# ========================= CONTACT PRESSURES ===========================
-# ========================================================================
 def contact_pressures(N, B, L):
     qavg = N / (B * L)
-    return qavg, qavg  # sin momentos → qserv = qmax = uniforme
+    return qavg, qavg
 
 # ========================================================================
 # =========================== OPTIMIZACIÓN ===============================
@@ -244,24 +283,5 @@ if st.button("🚀 Optimizar"):
         st.table(fo1[["B","L","h","qserv","qadm","qmax","s_mm","costo"]])
     with cB:
         st.subheader("FO2: Mínimo asentamiento")
-        st.table(fo2[["B","L","h","qserv","qadm","qmax","s_mm","costo"]])
-
-    def recomendar(fo1, fo2):
-        if (fo1.s_mm - fo2.s_mm >= 5.0) and (fo2.costo <= 1.05*fo1.costo):
-            return fo2, "FO2 (mínimo asentamiento)", "Menor asentamiento significativo."
-        return fo1, "FO1 (mínimo costo)", "Costo más eficiente."
-
-    chosen, tag, why = recomendar(fo1, fo2)
-
-    st.markdown(f"""
-    ## ✅ Recomendación final  
-    **{tag}**  
-    B = **{chosen.B:.2f} m**, L = **{chosen.L:.2f} m**, h = **{chosen.h:.2f} m**  
-    s = **{chosen.s_mm:.1f} mm** ≤ {s_adm_mm} mm  
-    Costo ≈ **S/ {chosen.costo:,.2f}**  
-    **Motivo:** {why}
-    """)
-
-    st.download_button("Descargar CSV de soluciones", df.to_csv(index=False), "soluciones.csv")
-
+        st.table(fo2[["B","]()]()
 
