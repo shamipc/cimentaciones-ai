@@ -1,6 +1,6 @@
 # ===============================================================
 # app.py — Optimización de Cimentaciones con ML (qu + asentamiento)
-# Versión: asentamiento igual al paper (SPT, B, Df/B, q)
+# Versión: asentamiento igual al paper (SPT, B, Df/B, q) + mejoras de predicción
 # ===============================================================
 
 import math
@@ -10,10 +10,11 @@ import streamlit as st
 
 # ============================= ML defensivo =============================
 try:
-    from sklearn.model_selection import GridSearchCV, KFold
+    from sklearn.model_selection import GridSearchCV, KFold, cross_val_predict
     from sklearn.ensemble import GradientBoostingRegressor
     from sklearn.preprocessing import StandardScaler
     from sklearn.pipeline import Pipeline
+    from sklearn.metrics import r2_score
     SKLEARN_OK = True
 except Exception:
     SKLEARN_OK = False
@@ -79,6 +80,8 @@ use_ml = st.toggle("Usar ML para q₍ult₎", value=False)
 
 
 def train_ml_qu(csv):
+    if not SKLEARN_OK:
+        raise RuntimeError("scikit-learn no disponible.")
     df = pd.read_csv(csv)
     req = ["gamma", "B", "D", "phi", "L_over_B", "qu"]
     miss = [c for c in req if c not in df.columns]
@@ -90,14 +93,15 @@ def train_ml_qu(csv):
 
     pipe = Pipeline([
         ("scaler", StandardScaler()),
-        ("model", GradientBoostingRegressor())
+        ("model", GradientBoostingRegressor(random_state=42))
     ])
 
     param_grid = {
-        "model__n_estimators": [300, 500, 800],
+        "model__n_estimators": [300, 600, 900],
         "model__max_depth": [2, 3, 4],
         "model__learning_rate": [0.03, 0.05, 0.1],
-        "model__min_samples_leaf": [3, 5, 8]
+        "model__min_samples_leaf": [1, 3, 5],
+        "model__subsample": [0.7, 0.9, 1.0],
     }
 
     cv = KFold(n_splits=5, shuffle=True, random_state=42)
@@ -125,7 +129,7 @@ if st.button("Entrenar modelo q₍ult₎"):
             model, r2 = train_ml_qu(up)
             st.session_state.ML_MODEL = model
             st.session_state.R2_ML = r2
-            st.success(f"Modelo q₍ult₎ entrenado. R² = {r2:.3f}")
+            st.success(f"Modelo q₍ult₎ entrenado. R² (CV) = {r2:.3f}")
         except Exception as e:
             st.error(str(e))
 
@@ -134,16 +138,19 @@ if st.button("Entrenar modelo q₍ult₎"):
 # ========================================================================
 st.subheader("Modelo ML para asentamiento (según paper 2024)")
 
-# ATENCIÓN: ahora el CSV debe tener columnas: SPT,B,Df_over_B,q,s_mm
+# CSV con columnas exactamente: SPT,B,Df_over_B,q,s_mm
 up_s = st.file_uploader("CSV asentamiento (SPT,B,Df_over_B,q,s_mm)", type=["csv"])
 use_ml_s = st.toggle("Usar ML para asentamiento", value=False)
 
 
 def train_ml_settlement(csv):
     """
-    Entrena el modelo de asentamiento exactamente como en el paper:
-    variables: SPT, B, Df/B, q → objetivo: s_mm
+    Entrena el modelo de asentamiento como en el paper:
+    variables: SPT, B, Df/B, q → objetivo: s_mm (trabajado en log1p).
+    Devuelve el modelo y el R² en la escala original de s_mm.
     """
+    if not SKLEARN_OK:
+        raise RuntimeError("scikit-learn no disponible.")
     df = pd.read_csv(csv)
 
     req = ["SPT", "B", "Df_over_B", "q", "s_mm"]
@@ -153,17 +160,19 @@ def train_ml_settlement(csv):
 
     X = df[["SPT", "B", "Df_over_B", "q"]]
     y = df["s_mm"].astype(float)
+    y_log = np.log1p(y)  # objetivo en log(1 + s)
 
     pipe = Pipeline([
         ("scaler", StandardScaler()),
-        ("model", GradientBoostingRegressor())
+        ("model", GradientBoostingRegressor(random_state=42))
     ])
 
     param_grid = {
-        "model__n_estimators": [300, 500, 800],
+        "model__n_estimators": [300, 600, 900],
         "model__max_depth": [2, 3, 4],
-        "model__learning_rate": [0.03, 0.05, 0.1],
-        "model__min_samples_leaf": [3, 5, 8]
+        "model__learning_rate": [0.01, 0.03, 0.05, 0.1],
+        "model__min_samples_leaf": [1, 3, 5],
+        "model__subsample": [0.7, 0.9, 1.0],
     }
 
     cv = KFold(n_splits=5, shuffle=True, random_state=42)
@@ -173,15 +182,19 @@ def train_ml_settlement(csv):
         param_grid,
         cv=cv,
         n_jobs=-1,
-        scoring="r2"
+        scoring="r2"  # R² en espacio log
     )
 
-    grid.fit(X, y)
+    grid.fit(X, y_log)
 
     best = grid.best_estimator_
-    r2 = grid.best_score_
 
-    return best, r2
+    # R² en escala original usando predicción cruzada
+    y_log_cv = cross_val_predict(best, X, y_log, cv=cv)
+    y_cv = np.expm1(y_log_cv)
+    r2_orig = r2_score(y, y_cv)
+
+    return best, r2_orig
 
 
 if st.button("Entrenar modelo asentamiento"):
@@ -194,7 +207,7 @@ if st.button("Entrenar modelo asentamiento"):
             model, r2 = train_ml_settlement(up_s)
             st.session_state.ML_S_MODEL = model
             st.session_state.R2_S = r2
-            st.success(f"Modelo asentamiento entrenado. R² = {r2:.3f}")
+            st.success(f"Modelo asentamiento entrenado. R² (escala original) = {r2:.3f}")
         except Exception as e:
             st.error(str(e))
 
@@ -250,7 +263,8 @@ def settlement_pred(SPT_val, B, D, qserv):
             "Df_over_B": df_over_B,
             "q": qserv
         }])
-        return float(st.session_state.ML_S_MODEL.predict(X)[0])
+        y_log_pred = st.session_state.ML_S_MODEL.predict(X)[0]
+        return float(np.expm1(y_log_pred))  # volver a mm
 
     return settlement_elastic(qserv, B, Es)
 
@@ -344,3 +358,4 @@ if st.button("🚀 Optimizar"):
         "soluciones.csv",
         "text/csv"
     )
+
