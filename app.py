@@ -397,7 +397,7 @@ col_qu, col_s = st.columns(2)
 
 # ---------- Gráfica para q_ult (solo ML) ----------
 with col_qu:
-    st.subheader("q₍ult₎ · Measured vs Calculated")
+    st.subheader("q₍ult₎ · Predecido ML vs Calculado (Meyerhof)")
 
     if st.session_state.ML_MODEL is None or st.session_state.DF_QU is None:
         st.info("Entrena primero el modelo de q₍ult₎ para ver esta gráfica.")
@@ -418,7 +418,7 @@ with col_qu:
 
 # ---------- Gráfica para asentamiento ----------
 with col_s:
-    st.subheader("Asentamiento · Measured vs Calculated")
+    st.subheader("Asentamiento · Predecido ML vs Calculado (Meyerhof) ")
 
     if st.session_state.ML_S_MODEL is None or st.session_state.DF_S is None:
         st.info("Entrena primero el modelo de asentamiento para ver esta gráfica.")
@@ -436,4 +436,5 @@ with col_s:
             "Calculated_s_ML": y_pred_s
         })
         st.scatter_chart(df_plot_s, x="Measured_s", y="Calculated_s_ML")
+
 
