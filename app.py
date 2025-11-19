@@ -1,12 +1,15 @@
 # ===============================================================
 # app.py — Optimización de Cimentaciones con ML (qu + asentamiento)
 # Versión: asentamiento igual al paper (SPT, B, Df/B, q) + mejoras de predicción
+# Sin q_max (carga centrada → presión uniforme)
+# + Gráficas Measured vs Calculated (ML vs métodos clásicos)
 # ===============================================================
 
 import math
 import numpy as np
 import pandas as pd
 import streamlit as st
+import matplotlib.pyplot as plt
 
 # ============================= ML defensivo =============================
 try:
@@ -31,11 +34,15 @@ if "ML_MODEL" not in st.session_state:
     st.session_state.ML_MODEL = None
 if "R2_ML" not in st.session_state:
     st.session_state.R2_ML = None
+if "DF_QU" not in st.session_state:
+    st.session_state.DF_QU = None
 
 if "ML_S_MODEL" not in st.session_state:
     st.session_state.ML_S_MODEL = None
 if "R2_S" not in st.session_state:
     st.session_state.R2_S = None
+if "DF_S" not in st.session_state:
+    st.session_state.DF_S = None
 
 # ========================================================================
 # ENTRADAS PRINCIPALES
@@ -116,7 +123,7 @@ def train_ml_qu(csv):
 
     grid.fit(X, y)
 
-    return grid.best_estimator_, grid.best_score_
+    return grid.best_estimator_, grid.best_score_, df
 
 
 if st.button("Entrenar modelo q₍ult₎"):
@@ -126,9 +133,10 @@ if st.button("Entrenar modelo q₍ult₎"):
         st.warning("Sube un archivo CSV válido.")
     else:
         try:
-            model, r2 = train_ml_qu(up)
+            model, r2, df_qu = train_ml_qu(up)
             st.session_state.ML_MODEL = model
             st.session_state.R2_ML = r2
+            st.session_state.DF_QU = df_qu  # guardar datos para las gráficas
             st.success(f"Modelo q₍ult₎ entrenado. R² (CV) = {r2:.3f}")
         except Exception as e:
             st.error(str(e))
@@ -194,7 +202,7 @@ def train_ml_settlement(csv):
     y_cv = np.expm1(y_log_cv)
     r2_orig = r2_score(y, y_cv)
 
-    return best, r2_orig
+    return best, r2_orig, df
 
 
 if st.button("Entrenar modelo asentamiento"):
@@ -204,9 +212,10 @@ if st.button("Entrenar modelo asentamiento"):
         st.warning("Sube un archivo CSV con columnas: SPT,B,Df_over_B,q,s_mm.")
     else:
         try:
-            model, r2 = train_ml_settlement(up_s)
+            model, r2, df_s = train_ml_settlement(up_s)
             st.session_state.ML_S_MODEL = model
             st.session_state.R2_S = r2
+            st.session_state.DF_S = df_s  # guardar datos para las gráficas
             st.success(f"Modelo asentamiento entrenado. R² (escala original) = {r2:.3f}")
         except Exception as e:
             st.error(str(e))
@@ -270,8 +279,8 @@ def settlement_pred(SPT_val, B, D, qserv):
 
 
 def contact_pressures(N, B, L):
-    qavg = N / (B * L)
-    return qavg, qavg   # sin momento → uniforme
+    """Presión de servicio promedio (carga centrada, sin momentos)."""
+    return N / (B * L)
 
 # ========================================================================
 # =========================== OPTIMIZACIÓN ===============================
@@ -291,9 +300,11 @@ if st.button("🚀 Optimizar"):
             qu = qult_pred(gamma, B, D, phi, L_over_B)
             qadm = qu / FS
 
-            qserv, qmax = contact_pressures(N, B, L)
+            # Presión de servicio (media)
+            qserv = contact_pressures(N, B, L)
 
-            if qserv > qadm or qmax > qadm:
+            # Verificación de capacidad portante
+            if qserv > qadm:
                 continue
 
             # Asentamiento (ML o clásico)
@@ -309,13 +320,13 @@ if st.button("🚀 Optimizar"):
                 (B * L * D) * 80     # excavación
             )
 
-            rows.append([B, L, h, qu, qadm, qserv, qmax, s, costo])
+            rows.append([B, L, h, qu, qadm, qserv, s, costo])
 
     if not rows:
         st.error("No se encontraron soluciones factibles.")
         st.stop()
 
-    df = pd.DataFrame(rows, columns=["B", "L", "h", "qu", "qadm", "qserv", "qmax", "s_mm", "costo"])
+    df = pd.DataFrame(rows, columns=["B", "L", "h", "qu", "qadm", "qserv", "s_mm", "costo"])
 
     fo1 = df.loc[df["costo"].idxmin()]
     fo2 = df.loc[df["s_mm"].idxmin()]
@@ -326,30 +337,49 @@ if st.button("🚀 Optimizar"):
 
     with cA:
         st.subheader("FO1 — Mínimo costo")
-        st.table(fo1[["B", "L", "h", "qserv", "qadm", "qmax", "s_mm", "costo"]])
+        st.table(fo1[["B", "L", "h", "qserv", "qadm", "s_mm", "costo"]])
 
     with cB:
         st.subheader("FO2 — Mínimo asentamiento")
-        st.table(fo2[["B", "L", "h", "qserv", "qadm", "qmax", "s_mm", "costo"]])
+        st.table(fo2[["B", "L", "h", "qserv", "qadm", "s_mm", "costo"]])
 
     def recomendar(fo1, fo2):
-        if (fo1.s_mm - fo2.s_mm >= 5) and (fo2.costo <= 1.05 * fo1.costo):
-            return fo2, "FO2 (mínimo asentamiento)", "Menor asentamiento con incremento de costo ≤ 5 %."
-        return fo1, "FO1 (mínimo costo)", "El menor costo domina y cumple las verificaciones."
+        """
+        Mini sistema experto:
+        - Si FO2 reduce el asentamiento ≥ 5 mm y su costo es ≤ 5 % más caro → prioriza FO2.
+        - En caso contrario → prioriza FO1 (más económico).
+        """
+        if (fo1.s_mm - fo2.s_mm >= 5.0) and (fo2.costo <= 1.05 * fo1.costo):
+            tag = "FO2 (mínimo asentamiento)"
+            motivo = (
+                f"Se prioriza un menor asentamiento (reducción de {fo1.s_mm - fo2.s_mm:.1f} mm) "
+                "con un incremento de costo aceptable (≤ 5 %)."
+            )
+            return fo2, tag, motivo
+        else:
+            tag = "FO1 (mínimo costo)"
+            motivo = (
+                "Se prioriza la solución más económica, dado que la reducción adicional de asentamiento "
+                "no justifica el incremento de costo."
+            )
+            return fo1, tag, motivo
 
     chosen, tag, why = recomendar(fo1, fo2)
 
     st.markdown(f"""
     ## ✅ Recomendación de Diseño  
-    **{tag}**  
+
+    **Solución seleccionada:** {tag}  
 
     - B = **{chosen.B:.2f} m**  
     - L = **{chosen.L:.2f} m**  
     - h = **{chosen.h:.2f} m**  
-    - Asentamiento = **{chosen.s_mm:.2f} mm** ≤ {s_adm_mm:.1f} mm  
-    - Costo ≈ **S/ {chosen.costo:,.2f}**  
+    - q_serv = **{chosen.qserv:.1f} kPa** ≤ q_adm = **{chosen.qadm:.1f} kPa**  
+    - Asentamiento estimado = **{chosen.s_mm:.2f} mm** ≤ {s_adm_mm:.1f} mm  
+    - Costo aproximado ≈ **S/ {chosen.costo:,.2f}**  
 
-    **Motivo:** {why}
+    **Criterio de elección entre FO1 y FO2:**  
+    {why}
     """)
 
     st.download_button(
@@ -358,4 +388,83 @@ if st.button("🚀 Optimizar"):
         "soluciones.csv",
         "text/csv"
     )
+
+# ========================================================================
+# ==================== GRÁFICAS MEASURED vs CALCULATED ===================
+# ========================================================================
+st.markdown("---")
+st.header("Análisis gráfico del desempeño de los modelos ML")
+
+col_qu, col_s = st.columns(2)
+
+# ---------- Gráfica para q_ult ----------
+with col_qu:
+    st.subheader("q₍ult₎ · ML vs Meyerhof")
+    if st.session_state.ML_MODEL is None or st.session_state.DF_QU is None:
+        st.info("Entrena primero el modelo de q₍ult₎ para ver esta gráfica.")
+    else:
+        df_qu = st.session_state.DF_QU.copy()
+        X_qu = df_qu[["gamma", "B", "D", "phi", "L_over_B"]]
+        y_qu = df_qu["qu"].astype(float)
+
+        # Predicción ML
+        y_pred_ml = st.session_state.ML_MODEL.predict(X_qu)
+
+        # Predicción Meyerhof clásica
+        qu_meyer = [
+            qult_meyerhof(B, D, phi, gamma)
+            for B, D, phi, gamma in zip(df_qu["B"], df_qu["D"], df_qu["phi"], df_qu["gamma"])
+        ]
+
+        # Límite para línea y=x
+        all_vals = np.concatenate([y_qu.values, np.array(y_pred_ml), np.array(qu_meyer)])
+        vmin = float(all_vals.min())
+        vmax = float(all_vals.max())
+        margin = 0.05 * (vmax - vmin)
+        vmin -= margin
+        vmax += margin
+
+        fig1, ax1 = plt.subplots()
+        ax1.plot(y_qu, y_pred_ml, "o", label="ML (Gradient Boosting)")
+        ax1.plot(y_qu, qu_meyer, "+", label="Meyerhof")
+        ax1.plot([vmin, vmax], [vmin, vmax], "--", label="y = x (predicción perfecta)")
+        ax1.set_xlabel("q₍ult₎ medido (kPa)")
+        ax1.set_ylabel("q₍ult₎ calculado (kPa)")
+        ax1.set_xlim(vmin, vmax)
+        ax1.set_ylim(vmin, vmax)
+        ax1.legend()
+        ax1.grid(True, alpha=0.3)
+        st.pyplot(fig1)
+
+# ---------- Gráfica para asentamiento ----------
+with col_s:
+    st.subheader("Asentamiento · ML vs medido")
+    if st.session_state.ML_S_MODEL is None or st.session_state.DF_S is None:
+        st.info("Entrena primero el modelo de asentamiento para ver esta gráfica.")
+    else:
+        df_s = st.session_state.DF_S.copy()
+        X_s = df_s[["SPT", "B", "Df_over_B", "q"]]
+        y_s = df_s["s_mm"].astype(float)
+
+        # Predicción ML (recordar que entrenamos en log, pero aquí queremos s_mm)
+        y_log_pred = st.session_state.ML_S_MODEL.predict(X_s)
+        y_pred_s = np.expm1(y_log_pred)
+
+        all_vals_s = np.concatenate([y_s.values, np.array(y_pred_s)])
+        vmin_s = float(all_vals_s.min())
+        vmax_s = float(all_vals_s.max())
+        margin_s = 0.05 * (vmax_s - vmin_s)
+        vmin_s -= margin_s
+        vmax_s += margin_s
+
+        fig2, ax2 = plt.subplots()
+        ax2.plot(y_s, y_pred_s, "o", label="ML asentamiento")
+        ax2.plot([vmin_s, vmax_s], [vmin_s, vmax_s], "--", label="y = x (predicción perfecta)")
+        ax2.set_xlabel("Asentamiento medido (mm)")
+        ax2.set_ylabel("Asentamiento calculado (mm)")
+        ax2.set_xlim(vmin_s, vmax_s)
+        ax2.set_ylim(vmin_s, vmax_s)
+        ax2.legend()
+        ax2.grid(True, alpha=0.3)
+        st.pyplot(fig2)
 
