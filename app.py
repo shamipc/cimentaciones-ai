@@ -1,5 +1,6 @@
 # ===============================================================
 # app.py — Optimización de Cimentaciones con ML (qu + asentamiento)
+# Versión: asentamiento igual al paper (SPT, B, Df/B, q)
 # ===============================================================
 
 import math
@@ -9,7 +10,7 @@ import streamlit as st
 
 # ============================= ML defensivo =============================
 try:
-    from sklearn.model_selection import train_test_split, GridSearchCV, KFold
+    from sklearn.model_selection import GridSearchCV, KFold
     from sklearn.ensemble import GradientBoostingRegressor
     from sklearn.preprocessing import StandardScaler
     from sklearn.pipeline import Pipeline
@@ -20,7 +21,7 @@ except Exception:
 
 st.set_page_config(page_title="Optimización de Cimentaciones con ML", layout="centered")
 st.title("Optimización de Cimentaciones (ML para q₍ult₎ y asentamiento)")
-st.caption("Incluye predicción ML optimizada para capacidad última y asentamiento basado en el paper 2024.")
+st.caption("q₍ult₎ con ML + asentamiento según paper 2024 (SPT, B, Df/B, q).")
 
 # ========================================================================
 # ESTADOS GLOBALES
@@ -35,16 +36,15 @@ if "ML_S_MODEL" not in st.session_state:
 if "R2_S" not in st.session_state:
     st.session_state.R2_S = None
 
-
 # ========================================================================
-# ENTRADAS
+# ENTRADAS PRINCIPALES
 # ========================================================================
 c1, c2 = st.columns(2)
 with c1:
     N = st.number_input("Carga axial N (kN)", 100.0, 200000.0, 800.0, 10.0)
     phi = st.number_input("ϕ (°)", 0.0, 45.0, 32.0, 0.5)
     gamma = st.number_input("γ (kN/m³)", 10.0, 24.0, 18.0, 0.1)
-    Es = st.number_input("Eₛ (kPa) si NO se usa ML", 3000.0, 100000.0, 25000.0, 500.0)
+    Es = st.number_input("Eₛ (kPa) si NO se usa ML (asentamiento clásico)", 3000.0, 100000.0, 25000.0, 500.0)
 
 with c2:
     D = st.number_input("Profundidad D (m)", 0.5, 6.0, 1.5, 0.1)
@@ -62,15 +62,12 @@ c3, c4, c5 = st.columns(3)
 with c3:
     Bmin = st.number_input("B min (m)", 0.5, 6.0, 1.0, 0.1)
     Bmax = st.number_input("B max (m)", 0.5, 6.0, 3.0, 0.1)
-
 with c4:
     hmin = st.number_input("h min (m)", 0.3, 2.0, 0.5, 0.05)
     hmax = st.number_input("h max (m)", 0.3, 2.0, 1.2, 0.05)
-
 with c5:
     nB = st.number_input("Puntos B", 5, 80, 30, 1)
     nh = st.number_input("Puntos h", 3, 60, 12, 1)
-
 
 # ========================================================================
 # =========================== ML PARA q_ULTIMO ===========================
@@ -128,28 +125,31 @@ if st.button("Entrenar modelo q₍ult₎"):
             model, r2 = train_ml_qu(up)
             st.session_state.ML_MODEL = model
             st.session_state.R2_ML = r2
-            st.success(f"Modelo q₍ult₎ entrenado correctamente. R² = {r2:.3f}")
+            st.success(f"Modelo q₍ult₎ entrenado. R² = {r2:.3f}")
         except Exception as e:
             st.error(str(e))
 
-
 # ========================================================================
-# ====================== ML PARA ASENTAMIENTO ===========================
+# ====================== ML PARA ASENTAMIENTO (PAPER) ====================
 # ========================================================================
 st.subheader("Modelo ML para asentamiento (según paper 2024)")
 
-up_s = st.file_uploader("CSV (SPT,B,D,q,s_mm)", type=["csv"])
+# ATENCIÓN: ahora el CSV debe tener columnas: SPT,B,Df_over_B,q,s_mm
+up_s = st.file_uploader("CSV asentamiento (SPT,B,Df_over_B,q,s_mm)", type=["csv"])
 use_ml_s = st.toggle("Usar ML para asentamiento", value=False)
 
 
 def train_ml_settlement(csv):
+    """
+    Entrena el modelo de asentamiento exactamente como en el paper:
+    variables: SPT, B, Df/B, q → objetivo: s_mm
+    """
     df = pd.read_csv(csv)
-    req = ["SPT", "B", "D", "q", "s_mm"]
+
+    req = ["SPT", "B", "Df_over_B", "q", "s_mm"]
     miss = [c for c in req if c not in df.columns]
     if miss:
         raise ValueError(f"Faltan columnas: {miss}")
-
-    df["Df_over_B"] = df["D"] / df["B"]
 
     X = df[["SPT", "B", "Df_over_B", "q"]]
     y = df["s_mm"].astype(float)
@@ -178,14 +178,17 @@ def train_ml_settlement(csv):
 
     grid.fit(X, y)
 
-    return grid.best_estimator_, grid.best_score_
+    best = grid.best_estimator_
+    r2 = grid.best_score_
+
+    return best, r2
 
 
 if st.button("Entrenar modelo asentamiento"):
     if not SKLEARN_OK:
         st.error("scikit-learn no disponible.")
     elif up_s is None:
-        st.warning("Sube un archivo CSV válido.")
+        st.warning("Sube un archivo CSV con columnas: SPT,B,Df_over_B,q,s_mm.")
     else:
         try:
             model, r2 = train_ml_settlement(up_s)
@@ -194,7 +197,6 @@ if st.button("Entrenar modelo asentamiento"):
             st.success(f"Modelo asentamiento entrenado. R² = {r2:.3f}")
         except Exception as e:
             st.error(str(e))
-
 
 # ========================================================================
 # =============== MODELOS CLÁSICOS COMO RESPALDO ========================
@@ -217,7 +219,7 @@ def qult_meyerhof(B, D, phi, gamma):
 
 
 def qult_pred(gamma, B, D, phi, L_over_B):
-    if use_ml and st.session_state.ML_MODEL is not None:
+    if use_ml and st.session_state.ML_MODEL is not None and SKLEARN_OK:
         X = pd.DataFrame([{
             "gamma": gamma,
             "B": B,
@@ -230,25 +232,32 @@ def qult_pred(gamma, B, D, phi, L_over_B):
 
 
 def settlement_elastic(qserv, B, Es, nu=0.30):
+    """Asentamiento elástico clásico (backup)."""
     return 1000 * (qserv * B * (1 - nu**2) / Es)
 
 
-def settlement_pred(SPT, B, D, qserv):
-    if use_ml_s and st.session_state.ML_S_MODEL is not None:
+def settlement_pred(SPT_val, B, D, qserv):
+    """
+    Predicción de asentamiento:
+    - Si ML está activo: usa SPT, B, Df_over_B=D/B, q → igual que el paper.
+    - Si no: usa el modelo elástico clásico.
+    """
+    if use_ml_s and st.session_state.ML_S_MODEL is not None and SKLEARN_OK:
+        df_over_B = D / B
         X = pd.DataFrame([{
-            "SPT": SPT,
+            "SPT": SPT_val,
             "B": B,
-            "Df_over_B": D / B,
+            "Df_over_B": df_over_B,
             "q": qserv
         }])
         return float(st.session_state.ML_S_MODEL.predict(X)[0])
+
     return settlement_elastic(qserv, B, Es)
 
 
 def contact_pressures(N, B, L):
     qavg = N / (B * L)
-    return qavg, qavg
-
+    return qavg, qavg   # sin momento → uniforme
 
 # ========================================================================
 # =========================== OPTIMIZACIÓN ===============================
@@ -273,17 +282,17 @@ if st.button("🚀 Optimizar"):
             if qserv > qadm or qmax > qadm:
                 continue
 
-            # Asentamiento
+            # Asentamiento (ML o clásico)
             s = settlement_pred(SPT, B, D, qserv)
             if s > s_adm_mm:
                 continue
 
-            # Costo simple
+            # Costo simple (puedes ajustar costes unitarios)
             vol = B * L * h
             costo = (
-                vol * 650 +
-                vol * 60 * 5.5 +
-                (B * L * D) * 80
+                vol * 650 +          # concreto
+                vol * 60 * 5.5 +     # acero (60 kg/m3)
+                (B * L * D) * 80     # excavación
             )
 
             rows.append([B, L, h, qu, qadm, qserv, qmax, s, costo])
@@ -292,7 +301,7 @@ if st.button("🚀 Optimizar"):
         st.error("No se encontraron soluciones factibles.")
         st.stop()
 
-    df = pd.DataFrame(rows, columns=["B","L","h","qu","qadm","qserv","qmax","s_mm","costo"])
+    df = pd.DataFrame(rows, columns=["B", "L", "h", "qu", "qadm", "qserv", "qmax", "s_mm", "costo"])
 
     fo1 = df.loc[df["costo"].idxmin()]
     fo2 = df.loc[df["s_mm"].idxmin()]
@@ -303,27 +312,28 @@ if st.button("🚀 Optimizar"):
 
     with cA:
         st.subheader("FO1 — Mínimo costo")
-        st.table(fo1[["B","L","h","qserv","qadm","qmax","s_mm","costo"]])
+        st.table(fo1[["B", "L", "h", "qserv", "qadm", "qmax", "s_mm", "costo"]])
 
     with cB:
         st.subheader("FO2 — Mínimo asentamiento")
-        st.table(fo2[["B","L","h","qserv","qadm","qmax","s_mm","costo"]])
+        st.table(fo2[["B", "L", "h", "qserv", "qadm", "qmax", "s_mm", "costo"]])
 
     def recomendar(fo1, fo2):
         if (fo1.s_mm - fo2.s_mm >= 5) and (fo2.costo <= 1.05 * fo1.costo):
-            return fo2, "FO2 (mínimo asentamiento)", "Menor asentamiento con costo razonable"
-        return fo1, "FO1 (mínimo costo)", "El menor costo domina y cumple verificaciones"
+            return fo2, "FO2 (mínimo asentamiento)", "Menor asentamiento con incremento de costo ≤ 5 %."
+        return fo1, "FO1 (mínimo costo)", "El menor costo domina y cumple las verificaciones."
 
     chosen, tag, why = recomendar(fo1, fo2)
 
     st.markdown(f"""
     ## ✅ Recomendación de Diseño  
     **{tag}**  
+
     - B = **{chosen.B:.2f} m**  
     - L = **{chosen.L:.2f} m**  
     - h = **{chosen.h:.2f} m**  
-    - Asentamiento = **{chosen.s_mm:.2f} mm**  
-    - Costo = **S/ {chosen.costo:,.2f}**  
+    - Asentamiento = **{chosen.s_mm:.2f} mm** ≤ {s_adm_mm:.1f} mm  
+    - Costo ≈ **S/ {chosen.costo:,.2f}**  
 
     **Motivo:** {why}
     """)
