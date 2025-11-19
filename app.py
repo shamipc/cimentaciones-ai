@@ -1,45 +1,13 @@
-# app.py — Optimización de Cimentaciones con ML opcional (qu y asentamiento)
-# Corrige error 'squared' en mean_squared_error con helper _rmse (compatible con scikit-learn antiguas)
+# app.py — versión mínima con 2 funciones objetivo (FO1 costo, FO2 asentamiento)
+# Verifica: q_serv ≤ q_adm, q_max ≤ q_adm y s ≤ s_adm
+# ML opcional (paper): si se entrena y activas el switch, predice qu con ML; si no, usa Meyerhof.
 
 import math
 import numpy as np
 import pandas as pd
 import streamlit as st
 
-# ================= Utilidades métricas (robusto a versiones antiguas) =================
-def _rmse(y_true, y_pred):
-    """RMSE robusto a versiones antiguas de scikit-learn (sin argumento 'squared')."""
-    try:
-        from sklearn.metrics import mean_squared_error
-        mse = mean_squared_error(y_true, y_pred)  # sin 'squared'
-        return float(np.sqrt(mse))
-    except Exception:
-        y_true = np.asarray(y_true, dtype=float)
-        y_pred = np.asarray(y_pred, dtype=float)
-        return float(np.sqrt(np.mean((y_true - y_pred) ** 2)))
-
-def _mae(y_true, y_pred):
-    try:
-        from sklearn.metrics import mean_absolute_error
-        return float(mean_absolute_error(y_true, y_pred))
-    except Exception:
-        y_true = np.asarray(y_true, dtype=float)
-        y_pred = np.asarray(y_pred, dtype=float)
-        return float(np.mean(np.abs(y_true - y_pred)))
-
-def _r2(y_true, y_pred):
-    try:
-        from sklearn.metrics import r2_score
-        return float(r2_score(y_true, y_pred))
-    except Exception:
-        # fallback de R² manual
-        y_true = np.asarray(y_true, dtype=float)
-        y_pred = np.asarray(y_pred, dtype=float)
-        ss_res = np.sum((y_true - y_pred) ** 2)
-        ss_tot = np.sum((y_true - np.mean(y_true)) ** 2)
-        return float(1.0 - ss_res / ss_tot) if ss_tot != 0 else float("nan")
-
-# ================= ML opcional: imports defensivos =================
+# ====== ML opcional (con importación defensiva) ======
 try:
     from sklearn.model_selection import train_test_split, GridSearchCV
     from sklearn.ensemble import GradientBoostingRegressor
@@ -48,12 +16,11 @@ except Exception:
     SKLEARN_OK = False
     train_test_split = GridSearchCV = GradientBoostingRegressor = None
 
-# ================= Streamlit config =================
-st.set_page_config(page_title="Cimentaciones • Optimización + ML", layout="wide")
-st.title("Optimización de Cimentaciones con ML opcional")
-st.caption("Dos funciones objetivo (FO1 costo, FO2 asentamiento). ML opcional para predecir **qu** y **s**.")
+st.set_page_config(page_title="Optimización de Cimentaciones — Minimal", layout="centered")
+st.title("Optimización de Cimentaciones (mínima)")
+st.caption("Entradas mínimas (paper) + 2 funciones objetivo (FO1 costo, FO2 asentamiento) con verificación de servicio.")
 
-# ================= Entradas básicas =================
+# ======================== Entradas mínimas ========================
 c1, c2 = st.columns(2)
 with c1:
     N = st.number_input("Carga axial N (kN)", 100.0, 2e5, 800.0, 10.0)
@@ -80,157 +47,67 @@ with c5:
 
 st.markdown("---")
 
-# =============================================================================
-#                    ML opcional — qu  y  asentamiento
-# =============================================================================
+# ======================== ML opcional (paper) ========================
+st.subheader("ML opcional (paper)")
 if not SKLEARN_OK:
-    st.warning("Para usar ML, agrega `scikit-learn>=1.3,<1.5` a requirements.txt. "
-               "Sin ML, se usa Meyerhof para qu y modelo elástico simple para s.")
+    st.warning("Para usar ML, agrega `scikit-learn>=1.3,<1.5` en requirements.txt. "
+               "Si no, se usará el método clásico (Meyerhof).")
 
-# Estado global
-for key in ["ML_MODEL_QU", "ML_MODEL_S", "ML_METRICS_QU", "ML_METRICS_S"]:
-    if key not in st.session_state:
-        st.session_state[key] = None if "MODEL" in key else {}
+# Estados globales mínimos
+if "ML_MODEL" not in st.session_state:
+    st.session_state.ML_MODEL = None
+if "RMSE_ML" not in st.session_state:
+    st.session_state.RMSE_ML = None
 
-c_ml1, c_ml2 = st.columns(2)
+up = st.file_uploader("CSV entrenamiento (gamma,B,D,phi,L_over_B,qu)", type=["csv"])
+use_ml = st.toggle("Usar modelo ML si está entrenado", value=False)
 
-# -------------------- Columna izquierda: modelo qu --------------------
-with c_ml1:
-    st.subheader("CSV qu (gamma,B,D,phi,L_over_B,qu)")
-    up_qu = st.file_uploader("Sube CSV para **qu**", type=["csv"], key="up_qu")
-    use_ml_qu = st.toggle("Usar ML para qu si está entrenado", value=False, key="switch_qu")
+def train_ml(csv):
+    df = pd.read_csv(csv)
+    req = ["gamma", "B", "D", "phi", "L_over_B", "qu"]
+    miss = [c for c in req if c not in df.columns]
+    if miss:
+        raise ValueError(f"Faltan columnas: {miss}")
 
-    def train_qu(csv_file):
-        df = pd.read_csv(csv_file)
-        req = ["gamma", "B", "D", "phi", "L_over_B", "qu"]
-        miss = [c for c in req if c not in df.columns]
-        if miss:
-            raise ValueError(f"Faltan columnas: {miss}")
+    X = df[["gamma", "B", "D", "phi", "L_over_B"]]
+    y = df["qu"].astype(float)
 
-        X = df[["gamma", "B", "D", "phi", "L_over_B"]]
-        y = df["qu"].astype(float)
+    Xtr, Xva, ytr, yva = train_test_split(X, y, test_size=0.20, random_state=42)
 
-        Xtr, Xva, ytr, yva = train_test_split(X, y, test_size=0.2, random_state=42)
+    gbr = GradientBoostingRegressor(random_state=42)
+    grid = GridSearchCV(
+        gbr,
+        {"n_estimators": [150, 300, 500],
+         "max_depth": [2, 3],
+         "learning_rate": [0.05, 0.1],
+         "min_samples_leaf": [3, 5]},
+        cv=5,
+        scoring="neg_root_mean_squared_error",
+        n_jobs=-1
+    )
+    grid.fit(Xtr, ytr)
+    best = grid.best_estimator_
 
-        gbr = GradientBoostingRegressor(random_state=42)
-        grid = GridSearchCV(
-            gbr,
-            {"n_estimators": [150, 300, 500],
-             "max_depth": [2, 3],
-             "learning_rate": [0.05, 0.1],
-             "min_samples_leaf": [3, 5]},
-            cv=5,
-            scoring="neg_mean_squared_error",  # MSE; luego hacemos sqrt para RMSE
-            n_jobs=-1
-        )
-        grid.fit(Xtr, ytr)
-        best = grid.best_estimator_
+    # RMSE en validación
+    yhat = best.predict(Xva)
+    rmse = float(np.sqrt(np.mean((yva - yhat) ** 2)))
+    return best, rmse
 
-        yhat = best.predict(Xva)
-        rmse = _rmse(yva, yhat)
-        mae = _mae(yva, yhat)
-        r2 = _r2(yva, yhat)
-        med = float(np.median(yva)) if len(yva) else float("nan")
-        nrmse_med = float(rmse / med * 100) if np.isfinite(med) and med != 0 else float("nan")
-        bias = float(np.mean(yhat - yva))
-        return best, {"rmse": rmse, "mae": mae, "r2": r2, "nrmse_med": nrmse_med, "bias": bias, "n_val": int(len(yva))}
+if st.button("Entrenar modelo", use_container_width=True):
+    if not SKLEARN_OK:
+        st.error("scikit-learn no está disponible en el entorno.")
+    elif up is None:
+        st.warning("Sube un CSV válido con columnas: gamma,B,D,phi,L_over_B,qu.")
+    else:
+        try:
+            model, rmse = train_ml(up)
+            st.session_state.ML_MODEL = model
+            st.session_state.RMSE_ML = rmse
+            st.success(f"Modelo entrenado. RMSE≈ {rmse:,.2f} kPa")
+        except Exception as e:
+            st.error(f"Error entrenando: {e}")
 
-    if st.button("Entrenar modelo de qu", use_container_width=True):
-        if not SKLEARN_OK:
-            st.error("scikit-learn no está disponible en el entorno.")
-        elif up_qu is None:
-            st.warning("Sube un CSV con columnas: gamma,B,D,phi,L_over_B,qu.")
-        else:
-            try:
-                model, metrics = train_qu(up_qu)
-                st.session_state.ML_MODEL_QU = model
-                st.session_state.ML_METRICS_QU = metrics
-                st.success(f"Modelo qu entrenado. RMSE≈ {metrics['rmse']:.2f} kPa")
-            except Exception as e:
-                st.error(f"Error entrenando qu: {e}")
-
-    if st.session_state.ML_METRICS_QU:
-        m = st.session_state.ML_METRICS_QU
-        st.caption("Métricas (validación qu)")
-        a,b,c,d,e = st.columns(5)
-        a.metric("R²", f"{m['r2']:.3f}" if np.isfinite(m['r2']) else "—")
-        b.metric("RMSE", f"{m['rmse']:.2f} kPa")
-        c.metric("MAE", f"{m['mae']:.2f} kPa")
-        d.metric("nRMSE/med", f"{m['nrmse_med']:.1f}%"
-                 if np.isfinite(m['nrmse_med']) else "—")
-        e.metric("Sesgo", f"{m['bias']:+.2f} kPa")
-
-# -------------------- Columna derecha: modelo asentamiento --------------------
-with c_ml2:
-    st.subheader("CSV asentamiento (gamma,B,D,phi,L_over_B,qserv,Es,s_mm)")
-    up_s = st.file_uploader("Sube CSV para **s**", type=["csv"], key="up_s")
-    use_ml_s = st.toggle("Usar ML para s si está entrenado", value=False, key="switch_s")
-
-    def train_s(csv_file):
-        df = pd.read_csv(csv_file)
-        req = ["gamma", "B", "D", "phi", "L_over_B", "qserv", "Es", "s_mm"]
-        miss = [c for c in req if c not in df.columns]
-        if miss:
-            raise ValueError(f"Faltan columnas: {miss}")
-
-        X = df[["gamma", "B", "D", "phi", "L_over_B", "qserv", "Es"]]
-        y = df["s_mm"].astype(float)
-
-        Xtr, Xva, ytr, yva = train_test_split(X, y, test_size=0.2, random_state=42)
-
-        gbr = GradientBoostingRegressor(random_state=42)
-        grid = GridSearchCV(
-            gbr,
-            {"n_estimators": [150, 300, 500],
-             "max_depth": [2, 3],
-             "learning_rate": [0.05, 0.1],
-             "min_samples_leaf": [3, 5]},
-            cv=5,
-            scoring="neg_mean_squared_error",
-            n_jobs=-1
-        )
-        grid.fit(Xtr, ytr)
-        best = grid.best_estimator_
-
-        yhat = best.predict(Xva)
-        rmse = _rmse(yva, yhat)
-        mae = _mae(yva, yhat)
-        r2 = _r2(yva, yhat)
-        med = float(np.median(yva)) if len(yva) else float("nan")
-        nrmse_med = float(rmse / med * 100) if np.isfinite(med) and med != 0 else float("nan")
-        bias = float(np.mean(yhat - yva))
-        return best, {"rmse": rmse, "mae": mae, "r2": r2, "nrmse_med": nrmse_med, "bias": bias, "n_val": int(len(yva))}
-
-    if st.button("Entrenar modelo de asentamiento", use_container_width=True):
-        if not SKLEARN_OK:
-            st.error("scikit-learn no está disponible en el entorno.")
-        elif up_s is None:
-            st.warning("Sube un CSV con columnas: gamma,B,D,phi,L_over_B,qserv,Es,s_mm.")
-        else:
-            try:
-                model, metrics = train_s(up_s)
-                st.session_state.ML_MODEL_S = model
-                st.session_state.ML_METRICS_S = metrics
-                st.success(f"Modelo s entrenado. RMSE≈ {metrics['rmse']:.2f} mm")
-            except Exception as e:
-                st.error(f"Error entrenando s: {e}")
-
-    if st.session_state.ML_METRICS_S:
-        m = st.session_state.ML_METRICS_S
-        st.caption("Métricas (validación s)")
-        a,b,c,d,e = st.columns(5)
-        a.metric("R²", f"{m['r2']:.3f}" if np.isfinite(m['r2']) else "—")
-        b.metric("RMSE", f"{m['rmse']:.2f} mm")
-        c.metric("MAE", f"{m['mae']:.2f} mm")
-        d.metric("nRMSE/med", f"{m['nrmse_med']:.1f}%"
-                 if np.isfinite(m['nrmse_med']) else "—")
-        e.metric("Sesgo", f"{m['bias']:+.2f} mm")
-
-st.markdown("---")
-
-# =============================================================================
-#                         Cálculos geotécnicos base
-# =============================================================================
+# ======================== Capacidad última ========================
 def bearing_factors(phi_deg: float):
     phi_rad = math.radians(phi_deg)
     if phi_rad < 1e-6:
@@ -242,12 +119,25 @@ def bearing_factors(phi_deg: float):
     return Nc, Nq, Ng
 
 def qult_meyerhof(B, D, phi, gamma):
+    # c≈0 (arenas/friccionantes); coef. de forma rectangulares
     Nc, Nq, Ng = bearing_factors(phi)
-    sc, sq, sg = 1.3, 1.2, 1.0  # forma rectangular
+    sc, sq, sg = 1.3, 1.2, 1.0
     q_eff = gamma * D
     return q_eff * Nq * sq + 0.5 * gamma * B * Ng * sg
 
+def qult_pred(gamma_val, B, D, phi_val, L_over_B_val):
+    """Predicción de qu: usa ML si está entrenado y el switch está activo; si no, Meyerhof."""
+    if use_ml and (st.session_state.ML_MODEL is not None) and SKLEARN_OK:
+        X = pd.DataFrame([{
+            "gamma": gamma_val, "B": B, "D": D, "phi": phi_val, "L_over_B": L_over_B_val
+        }])
+        return float(st.session_state.ML_MODEL.predict(X)[0])
+    # Clásico
+    return qult_meyerhof(B, D, phi_val, gamma_val)
+
+# ======================== Servicio y asentamiento =============
 def contact_pressures(N, B, L, ex=0.0, ey=0.0):
+    """q_serv y q_max considerando núcleo/área efectiva (sin momentos por defecto)."""
     qavg = N / (B * L)
     in_kern = (abs(ex) <= B / 6) and (abs(ey) <= L / 6)
     if in_kern:
@@ -261,36 +151,20 @@ def contact_pressures(N, B, L, ex=0.0, ey=0.0):
         qmax = 2 * N / (Beff * Leff)
     return qserv, qmax
 
-def settlement_elastic_mm(qserv_kpa, B_m, Es_kpa, nu=0.30):
+def settlement_mm(qserv_kpa, B_m, Es_kpa, nu=0.30):
+    """Modelo elástico simple: s ≈ q·B·(1-ν²)/Es → mm."""
     return 1000.0 * (qserv_kpa * B_m * (1 - nu ** 2) / Es_kpa)
 
-# Predictores unificados con ML opcional
-def qult_pred(gamma_val, B, D, phi_val, L_over_B_val):
-    if SKLEARN_OK and st.session_state.ML_MODEL_QU is not None and st.session_state.get("switch_qu", False):
-        X = pd.DataFrame([{"gamma": gamma_val, "B": B, "D": D, "phi": phi_val, "L_over_B": L_over_B_val}])
-        return float(st.session_state.ML_MODEL_QU.predict(X)[0])
-    return qult_meyerhof(B, D, phi_val, gamma_val)
-
-def s_pred(gamma_val, B, D, phi_val, L_over_B_val, qserv_kpa, Es_kpa):
-    if SKLEARN_OK and st.session_state.ML_MODEL_S is not None and st.session_state.get("switch_s", False):
-        X = pd.DataFrame([{
-            "gamma": gamma_val, "B": B, "D": D, "phi": phi_val, "L_over_B": L_over_B_val,
-            "qserv": qserv_kpa, "Es": Es_kpa
-        }])
-        return float(st.session_state.ML_MODEL_S.predict(X)[0])
-    return settlement_elastic_mm(qserv_kpa, B, Es_kpa)
-
-# Costo simple
+# ======================== Costo ================================
 def cost_S(B, L, h, c_conc=650.0, c_acero_kg=5.5, acero_kg_m3=60.0, c_exc=80.0, D=1.5):
+    """Costo simple (S/): concreto + acero + excavación."""
     vol = B * L * h
     acero_kg = acero_kg_m3 * vol
     exc = B * L * D
     return vol * c_conc + acero_kg * c_acero_kg + exc * c_exc
 
-# =============================================================================
-#                                 Optimización
-# =============================================================================
-if st.button("🚀 Optimizar (FO1 & FO2)", use_container_width=True):
+# ======================== Corrida principal ====================
+if st.button("🚀 Optimizar (FO1 & FO2)"):
     Bs = np.linspace(Bmin, Bmax, int(nB))
     hs = np.linspace(hmin, hmax, int(nh))
 
@@ -300,10 +174,10 @@ if st.button("🚀 Optimizar (FO1 & FO2)", use_container_width=True):
         for h in hs:
             qu = qult_pred(gamma, B, D, phi, L_over_B)
             qadm = qu / FS
-            qserv, qmax = contact_pressures(N, B, L)
+            qserv, qmax = contact_pressures(N, B, L)  # sin excentricidad por simplicidad
             if not (qserv <= qadm and qmax <= qadm):
                 continue
-            s = s_pred(gamma, B, D, phi, L_over_B, qserv, Es)
+            s = settlement_mm(qserv, B, Es)
             if s > s_adm_mm:
                 continue
             costo = cost_S(B, L, h, D=D)
@@ -313,27 +187,20 @@ if st.button("🚀 Optimizar (FO1 & FO2)", use_container_width=True):
         st.error("Sin soluciones factibles con los parámetros dados.")
         st.stop()
 
-    df = pd.DataFrame(rows, columns=["B","L","h","qu","qadm","qserv","qmax","s_mm","costo"])
+    df = pd.DataFrame(rows, columns=["B", "L", "h", "qu", "qadm", "qserv", "qmax", "s_mm", "costo"])
 
-    # FO1: costo mínimo | FO2: asentamiento mínimo
+    # FO1: costo mínimo
     fo1 = df.loc[df["costo"].idxmin()]
+    # FO2: asentamiento mínimo
     fo2 = df.loc[df["s_mm"].idxmin()]
 
-    # Banner del modelo usado
-    banner = []
-    if st.session_state.get("switch_qu", False) and st.session_state.ML_METRICS_QU:
-        m = st.session_state.ML_METRICS_QU
-        banner.append(f"qu-ML RMSE≈{m['rmse']:.1f} kPa R²≈{m['r2']:.2f}")
+    # ===== Banner del modelo usado =====
+    if use_ml and (st.session_state.ML_MODEL is not None) and SKLEARN_OK:
+        st.success(f"Modelo de capacidad usado: **ML (paper)** — RMSE≈ {st.session_state.RMSE_ML:,.2f} kPa")
     else:
-        banner.append("qu: Meyerhof")
-    if st.session_state.get("switch_s", False) and st.session_state.ML_METRICS_S:
-        m2 = st.session_state.ML_METRICS_S
-        banner.append(f"s-ML RMSE≈{m2['rmse']:.1f} mm R²≈{m2['r2']:.2f}")
-    else:
-        banner.append("s: elástico simple")
+        st.success("Modelo de capacidad usado: **Meyerhof (clásico)**")
 
-    st.success("Modelo de capacidad/servicio usado → " + " | ".join(banner))
-
+    # ===== Mostrar FO1 y FO2 =====
     cA, cB = st.columns(2)
     with cA:
         st.subheader("FO1 · Mínimo costo")
@@ -342,19 +209,19 @@ if st.button("🚀 Optimizar (FO1 & FO2)", use_container_width=True):
         st.subheader("FO2 · Mínimo asentamiento")
         st.table(fo2[["B","L","h","qserv","qadm","qmax","s_mm","costo"]])
 
-    # Recomendación (simple)
+    # ===== Recomendación (elige FO1 o FO2) =====
+    # Criterio: si FO2 baja s en ≥5 mm respecto a FO1 y su costo ≤ +5% del FO1, toma FO2; si no, FO1.
     def recomendar(fo1, fo2):
         s1, s2 = fo1.s_mm, fo2.s_mm
         c1, c2 = fo1.costo, fo2.costo
         if (s1 - s2 >= 5.0) and (c2 <= 1.05 * c1):
             tag = "FO2 (mínimo asentamiento)"
-            why = f"Menor s (−{s1 - s2:.1f} mm) con costo ≤ +5%."
-            return fo2, tag, why
+            return fo2, tag, f"Se elige FO2 por menor asentamiento (−{s1 - s2:.1f} mm) con costo ≤ +5%."
         tag = "FO1 (mínimo costo)"
-        why = "El ahorro de costo domina y se cumplen verificaciones."
-        return fo1, tag, why
+        return fo1, tag, "Se elige FO1: el ahorro de costo domina y las verificaciones se cumplen."
 
     chosen, tag, why = recomendar(fo1, fo2)
+
     st.markdown("## ✅ Recomendación")
     st.write(
         f"**{tag}**  \n"
@@ -366,8 +233,12 @@ if st.button("🚀 Optimizar (FO1 & FO2)", use_container_width=True):
         f"**Motivo:** {why}"
     )
 
-    st.download_button("Descargar soluciones (CSV)",
-                       df.to_csv(index=False), "soluciones.csv", "text/csv",
-                       use_container_width=True)
+    st.download_button(
+        "Descargar soluciones (CSV)",
+        df.to_csv(index=False),
+        "soluciones_minimal.csv",
+        "text/csv",
+        use_container_width=True,
+    )
 
 
