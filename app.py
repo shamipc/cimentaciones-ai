@@ -311,16 +311,24 @@ if st.button("🚀 Optimizar"):
             if s > s_adm_mm:
                 continue
 
-            # Costo simple (puedes ajustar costes unitarios)
+           # ===================== Costo simple =====================
             vol = B * L * h
+
+            # Valores de ejemplo tipo Revista Costos / CAPECO
+            # (ajusta estos números con los datos reales que tengas)
+            c_conc = 420.0       # S/ por m³ de concreto
+            acero_kg_m3 = 75.0   # kg de acero por m³
+            c_acero_kg = 7.0     # S/ por kg de acero
+            c_exc = 95.0         # S/ por m³ de excavación
+
             costo = (
-                vol * 650 +          # concreto
-                vol * 60 * 5.5 +     # acero (60 kg/m3)
-                (B * L * D) * 80     # excavación
+                vol * c_conc +                 # concreto
+                vol * acero_kg_m3 * c_acero_kg +  # acero
+                (B * L * D) * c_exc            # excavación
             )
+            # =======================================================
 
             rows.append([B, L, h, qu, qadm, qserv, s, costo])
-
     if not rows:
         st.error("No se encontraron soluciones factibles.")
         st.stop()
@@ -450,4 +458,5 @@ with col_s:
             "Calculated_s_ML": y_pred_s
         })
         st.scatter_chart(df_plot_s, x="Measured_s", y="Calculated_s_ML")
+
 
