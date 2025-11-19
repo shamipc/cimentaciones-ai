@@ -365,7 +365,75 @@ if st.button("🚀 Optimizar"):
 
     chosen, tag, why = recomendar(fo1, fo2)
 
-    st.markdown(f"""
-    ## ✅ Recomendación de Diseño  
+    texto_md = (
+        "## ✅ Recomendación de Diseño  \n\n"
+        f"**Solución seleccionada:** {tag}  \n\n"
+        f"- B = **{chosen.B:.2f} m**  \n"
+        f"- L = **{chosen.L:.2f} m**  \n"
+        f"- h = **{chosen.h:.2f} m**  \n"
+        f"- q_serv = **{chosen.qserv:.1f} kPa** ≤ q_adm = **{chosen.qadm:.1f} kPa**  \n"
+        f"- Asentamiento estimado = **{chosen.s_mm:.2f} mm** ≤ {s_adm_mm:.1f} mm  \n"
+        f"- Costo aproximado ≈ **S/ {chosen.costo:,.2f}**  \n\n"
+        f"**Criterio de elección entre FO1 y FO2:**  \n"
+        f"{why}"
+    )
 
-    **Soluci**
+    st.markdown(texto_md)
+
+    st.download_button(
+        "Descargar soluciones (CSV)",
+        df.to_csv(index=False),
+        "soluciones.csv",
+        "text/csv"
+    )
+
+# ========================================================================
+# ==================== GRÁFICAS MEASURED vs CALCULATED ===================
+# ========================================================================
+st.markdown("---")
+st.header("Análisis gráfico del desempeño de los modelos ML")
+
+col_qu, col_s = st.columns(2)
+
+# ---------- Gráfica para q_ult (solo ML) ----------
+with col_qu:
+    st.subheader("q₍ult₎ · Measured vs Calculated")
+
+    if st.session_state.ML_MODEL is None or st.session_state.DF_QU is None:
+        st.info("Entrena primero el modelo de q₍ult₎ para ver esta gráfica.")
+    else:
+        df_qu = st.session_state.DF_QU.copy()
+        X_qu = df_qu[["gamma", "B", "D", "phi", "L_over_B"]]
+        y_qu = df_qu["qu"].astype(float)
+
+        # Predicción ML
+        y_pred_ml = st.session_state.ML_MODEL.predict(X_qu)
+
+        st.caption("Modelo ML (Gradient Boosting)")
+        df_plot_ml = pd.DataFrame({
+            "Measured_qu": y_qu,
+            "Calculated_qu_ML": y_pred_ml
+        })
+        st.scatter_chart(df_plot_ml, x="Measured_qu", y="Calculated_qu_ML")
+
+# ---------- Gráfica para asentamiento ----------
+with col_s:
+    st.subheader("Asentamiento · Measured vs Calculated")
+
+    if st.session_state.ML_S_MODEL is None or st.session_state.DF_S is None:
+        st.info("Entrena primero el modelo de asentamiento para ver esta gráfica.")
+    else:
+        df_s = st.session_state.DF_S.copy()
+        X_s = df_s[["SPT", "B", "Df_over_B", "q"]]
+        y_s = df_s["s_mm"].astype(float)
+
+        # Predicción ML (recordar que entrenamos en log, pero aquí queremos s_mm)
+        y_log_pred = st.session_state.ML_S_MODEL.predict(X_s)
+        y_pred_s = np.expm1(y_log_pred)
+
+        df_plot_s = pd.DataFrame({
+            "Measured_s": y_s,
+            "Calculated_s_ML": y_pred_s
+        })
+        st.scatter_chart(df_plot_s, x="Measured_s", y="Calculated_s_ML")
+
