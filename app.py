@@ -1,7 +1,6 @@
 # app.py — versión mínima con 2 funciones objetivo (FO1 costo, FO2 asentamiento)
 # Verifica: q_serv ≤ q_adm, q_max ≤ q_adm y s ≤ s_adm
 # ML opcional (paper): si se entrena y activas el switch, predice qu con ML; si no, usa Meyerhof.
-# Muestra métricas de validación: RMSE, MAE, R², nRMSE (sobre mediana) y Sesgo.
 
 import math
 import numpy as np
@@ -12,28 +11,21 @@ import streamlit as st
 try:
     from sklearn.model_selection import train_test_split, GridSearchCV
     from sklearn.ensemble import GradientBoostingRegressor
-    from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
     SKLEARN_OK = True
 except Exception:
     SKLEARN_OK = False
     train_test_split = GridSearchCV = GradientBoostingRegressor = None
-    mean_squared_error = mean_absolute_error = r2_score = None
 
 st.set_page_config(page_title="Optimización de Cimentaciones — Minimal", layout="centered")
 st.title("Optimización de Cimentaciones (mínima)")
 st.caption("Entradas mínimas (paper) + 2 funciones objetivo (FO1 costo, FO2 asentamiento) con verificación de servicio.")
-
-# ---------------------------------------------------------------------
-# Lista de columnas esperadas por el modelo (orden canónico)
-FEATURE_LIST = ["gamma_eff", "B", "D", "phi", "L_over_B"]
-# ---------------------------------------------------------------------
 
 # ======================== Entradas mínimas ========================
 c1, c2 = st.columns(2)
 with c1:
     N = st.number_input("Carga axial N (kN)", 100.0, 2e5, 800.0, 10.0)
     phi = st.number_input("ϕ (°)", 0.0, 45.0, 32.0, 0.5)
-    gamma_eff = st.number_input("γ efectivo en base (kN/m³) → gamma_eff", 10.0, 24.0, 18.0, 0.1)
+    gamma = st.number_input("γ efectivo en base (kN/m³)", 10.0, 24.0, 18.0, 0.1)
     Es = st.number_input("Eₛ (kPa) para s (aprox.)", 3000.0, 100000.0, 25000.0, 500.0)
 with c2:
     D = st.number_input("Profundidad de base D (m)", 0.5, 6.0, 1.5, 0.1)
@@ -56,7 +48,7 @@ with c5:
 st.markdown("---")
 
 # ======================== ML opcional (paper) ========================
-st.subheader("ML opcional (paper) — auto-ML")
+st.subheader("ML opcional (paper)")
 if not SKLEARN_OK:
     st.warning("Para usar ML, agrega `scikit-learn>=1.3,<1.5` en requirements.txt. "
                "Si no, se usará el método clásico (Meyerhof).")
@@ -66,29 +58,18 @@ if "ML_MODEL" not in st.session_state:
     st.session_state.ML_MODEL = None
 if "RMSE_ML" not in st.session_state:
     st.session_state.RMSE_ML = None
-if "ML_METRICS" not in st.session_state:
-    st.session_state.ML_METRICS = {}
-if "FEATURES" not in st.session_state:
-    st.session_state.FEATURES = FEATURE_LIST[:]
 
-# Botón para limpiar estado (evita usar modelos entrenados con columnas distintas)
-if st.button("🔄 Reiniciar/olvidar modelo ML"):
-    for k in ("ML_MODEL", "RMSE_ML", "ML_METRICS", "FEATURES"):
-        st.session_state.pop(k, None)
-    st.session_state.FEATURES = FEATURE_LIST[:]
-    st.success("Modelo/estado ML reiniciado. Vuelve a entrenar con el CSV correcto.")
-
-up = st.file_uploader("CSV entrenamiento (gamma_eff,B,D,phi,L_over_B,qu)", type=["csv"])
+up = st.file_uploader("CSV entrenamiento (gamma,B,D,phi,L_over_B,qu)", type=["csv"])
 use_ml = st.toggle("Usar modelo ML si está entrenado", value=False)
 
 def train_ml(csv):
     df = pd.read_csv(csv)
-    req = FEATURE_LIST + ["qu"]
+    req = ["gamma", "B", "D", "phi", "L_over_B", "qu"]
     miss = [c for c in req if c not in df.columns]
     if miss:
         raise ValueError(f"Faltan columnas: {miss}")
 
-    X = df[FEATURE_LIST].astype(float)
+    X = df[["gamma", "B", "D", "phi", "L_over_B"]]
     y = df["qu"].astype(float)
 
     Xtr, Xva, ytr, yva = train_test_split(X, y, test_size=0.20, random_state=42)
@@ -96,12 +77,10 @@ def train_ml(csv):
     gbr = GradientBoostingRegressor(random_state=42)
     grid = GridSearchCV(
         gbr,
-        {
-            "n_estimators": [150, 300, 500],
-            "max_depth": [2, 3],
-            "learning_rate": [0.05, 0.1],
-            "min_samples_leaf": [3, 5],
-        },
+        {"n_estimators": [150, 300, 500],
+         "max_depth": [2, 3],
+         "learning_rate": [0.05, 0.1],
+         "min_samples_leaf": [3, 5]},
         cv=5,
         scoring="neg_root_mean_squared_error",
         n_jobs=-1
@@ -109,38 +88,16 @@ def train_ml(csv):
     grid.fit(Xtr, ytr)
     best = grid.best_estimator_
 
-    # Guarda el orden real de columnas que el modelo aprendió
-    try:
-        st.session_state.FEATURES = list(best.feature_names_in_)
-    except Exception:
-        st.session_state.FEATURES = FEATURE_LIST[:]
-
-    # ===== Métricas de validación =====
+    # RMSE en validación
     yhat = best.predict(Xva)
-    rmse = float(mean_squared_error(yva, yhat, squared=False))
-    mae  = float(mean_absolute_error(yva, yhat))
-    try:
-        r2 = float(r2_score(yva, yhat))
-    except Exception:
-        r2 = float("nan")
-    med = float(np.median(yva)) if len(yva) else float("nan")
-    nrmse_med = float(rmse / med * 100) if np.isfinite(med) and med != 0 else float("nan")
-    bias = float(np.mean(yhat - yva))
-    st.session_state.ML_METRICS = {
-        "rmse": rmse,
-        "mae": mae,
-        "r2": r2,
-        "nrmse_med": nrmse_med,
-        "bias": bias,
-        "n_val": int(len(yva)),
-    }
+    rmse = float(np.sqrt(np.mean((yva - yhat) ** 2)))
     return best, rmse
 
 if st.button("Entrenar modelo", use_container_width=True):
     if not SKLEARN_OK:
         st.error("scikit-learn no está disponible en el entorno.")
     elif up is None:
-        st.warning("Sube un CSV válido con columnas: gamma_eff,B,D,phi,L_over_B,qu.")
+        st.warning("Sube un CSV válido con columnas: gamma,B,D,phi,L_over_B,qu.")
     else:
         try:
             model, rmse = train_ml(up)
@@ -149,20 +106,6 @@ if st.button("Entrenar modelo", use_container_width=True):
             st.success(f"Modelo entrenado. RMSE≈ {rmse:,.2f} kPa")
         except Exception as e:
             st.error(f"Error entrenando: {e}")
-
-# Panel de métricas visible tras entrenar
-if st.session_state.ML_METRICS:
-    m = st.session_state.ML_METRICS
-    st.markdown("### Métricas del modelo (validación)")
-    c1m, c2m, c3m, c4m, c5m = st.columns(5)
-    c1m.metric("R²", f"{m['r2']:.3f}" if np.isfinite(m['r2']) else "—")
-    c2m.metric("RMSE", f"{m['rmse']:.2f} kPa")
-    c3m.metric("MAE", f"{m['mae']:.2f} kPa")
-    c4m.metric("nRMSE / Mediana", f"{m['nrmse_med']:.1f}%" if np.isfinite(m['nrmse_med']) else "—")
-    c5m.metric("Sesgo", f"{m['bias']:+.2f} kPa")
-    st.caption(f"Conjunto de validación: n = {m['n_val']}")
-
-st.markdown("---")
 
 # ======================== Capacidad última ========================
 def bearing_factors(phi_deg: float):
@@ -175,34 +118,22 @@ def bearing_factors(phi_deg: float):
         Ng = 2.0 * (Nq + 1.0) * math.tan(phi_rad)
     return Nc, Nq, Ng
 
-def qult_meyerhof(B, D, phi, gamma_eff_val):
+def qult_meyerhof(B, D, phi, gamma):
     # c≈0 (arenas/friccionantes); coef. de forma rectangulares
     Nc, Nq, Ng = bearing_factors(phi)
     sc, sq, sg = 1.3, 1.2, 1.0
-    q_eff = gamma_eff_val * D
-    return q_eff * Nq * sq + 0.5 * gamma_eff_val * B * Ng * sg
+    q_eff = gamma * D
+    return q_eff * Nq * sq + 0.5 * gamma * B * Ng * sg
 
-def qult_pred(gamma_eff_val, B_val, D_val, phi_val, L_over_B_val):
-    """Predicción de qu: usa ML si está entrenado y el switch activo; si no, Meyerhof."""
-    if use_ml and (st.session_state.get("ML_MODEL") is not None) and SKLEARN_OK:
-        model = st.session_state.ML_MODEL
-
+def qult_pred(gamma_val, B, D, phi_val, L_over_B_val):
+    """Predicción de qu: usa ML si está entrenado y el switch está activo; si no, Meyerhof."""
+    if use_ml and (st.session_state.ML_MODEL is not None) and SKLEARN_OK:
         X = pd.DataFrame([{
-            "gamma_eff": gamma_eff_val,
-            "B": B_val,
-            "D": D_val,
-            "phi": phi_val,
-            "L_over_B": L_over_B_val
+            "gamma": gamma_val, "B": B, "D": D, "phi": phi_val, "L_over_B": L_over_B_val
         }])
-
-        # Ordena columnas como las del modelo (o respaldo FEATURE_LIST)
-        cols = list(getattr(model, "feature_names_in_", st.session_state.get("FEATURES", FEATURE_LIST)))
-        X = X.reindex(columns=cols).astype(float)
-
-        return float(model.predict(X)[0])
-
-    # Clásico Meyerhof
-    return qult_meyerhof(B_val, D_val, phi_val, gamma_eff_val)
+        return float(st.session_state.ML_MODEL.predict(X)[0])
+    # Clásico
+    return qult_meyerhof(B, D, phi_val, gamma_val)
 
 # ======================== Servicio y asentamiento =============
 def contact_pressures(N, B, L, ex=0.0, ey=0.0):
@@ -241,7 +172,7 @@ if st.button("🚀 Optimizar (FO1 & FO2)"):
     for B in Bs:
         L = L_over_B * B
         for h in hs:
-            qu = qult_pred(gamma_eff, B, D, phi, L_over_B)
+            qu = qult_pred(gamma, B, D, phi, L_over_B)
             qadm = qu / FS
             qserv, qmax = contact_pressures(N, B, L)  # sin excentricidad por simplicidad
             if not (qserv <= qadm and qmax <= qadm):
@@ -264,17 +195,8 @@ if st.button("🚀 Optimizar (FO1 & FO2)"):
     fo2 = df.loc[df["s_mm"].idxmin()]
 
     # ===== Banner del modelo usado =====
-    if use_ml and (st.session_state.get("ML_MODEL") is not None) and SKLEARN_OK:
-        if st.session_state.ML_METRICS:
-            m = st.session_state.ML_METRICS
-            st.success(
-                "Modelo de capacidad usado: **ML (paper)** — "
-                f"RMSE≈ {m['rmse']:.2f} kPa | MAE≈ {m['mae']:.2f} kPa | "
-                f"R²≈ {m['r2']:.3f} | nRMSE≈ {m['nrmse_med']:.1f}% | "
-                f"Sesgo≈ {m['bias']:+.2f} kPa"
-            )
-        else:
-            st.success(f"Modelo de capacidad usado: **ML (paper)** — RMSE≈ {st.session_state.RMSE_ML:,.2f} kPa")
+    if use_ml and (st.session_state.ML_MODEL is not None) and SKLEARN_OK:
+        st.success(f"Modelo de capacidad usado: **ML (paper)** — RMSE≈ {st.session_state.RMSE_ML:,.2f} kPa")
     else:
         st.success("Modelo de capacidad usado: **Meyerhof (clásico)**")
 
@@ -318,6 +240,5 @@ if st.button("🚀 Optimizar (FO1 & FO2)"):
         "text/csv",
         use_container_width=True,
     )
-
 
 
